@@ -3,9 +3,19 @@ import { listDir, rawUrl, stat } from "../api/client";
 import type { Entry, SortDir, SortKey } from "../api/types";
 import { ErrorBanner, Spinner } from "../components/Feedback";
 import { Icon } from "../components/Icon";
+import { ContextMenu, useContextMenu, type MenuItem } from "../components/ContextMenu";
 import { useAsync } from "../hooks/useAsync";
+import { copyAndToast, triggerDownload } from "../lib/actions";
 import { formatBytesExact, formatSize } from "../lib/format";
-import { isPlaylistEntry, mediaKind, playability, type MediaKind } from "../lib/media";
+import {
+  isPlaylistEntry,
+  mediaKind,
+  mediaMimeFor,
+  playability,
+  serverClassificationMessage,
+  serverStreamsInline,
+  type MediaKind,
+} from "../lib/media";
 import { basename, isVirtual, parentPath } from "../lib/paths";
 import { navigate, playHref, viewHref } from "../lib/router";
 
@@ -53,7 +63,18 @@ const NO_SIBLINGS: Entry[] = [];
  * ↑/↓ (and the ‹ › buttons) walk the media siblings of this file in that same
  * order, navigating this window in place rather than opening more of them.
  */
-export function PlayerView({ path, sort, dir }: { path: string; sort: SortKey; dir: SortDir }) {
+export function PlayerView({
+  path,
+  sort,
+  dir,
+  force,
+}: {
+  path: string;
+  sort: SortKey;
+  dir: SortDir;
+  /** "Play as media…": mount the player for a file nothing detected as media. */
+  force?: boolean;
+}) {
   const name = basename(path);
   const parent = useMemo(() => parentPath(path), [path]);
 
@@ -154,7 +175,17 @@ export function PlayerView({ path, sort, dir }: { path: string; sort: SortKey; d
     };
   }, [name]);
 
-  const kind = mediaKind(entry?.mime);
+  const kind = mediaKind(entry?.mime, entry?.name ?? name) ?? (force ? "video" : null);
+
+  /**
+   * The daemon, not the SPA, decides what `fs/raw` streams: only what *it*
+   * classifies as `video/*` or `audio/*` comes back inline; everything else is
+   * an `application/octet-stream` attachment a media element cannot read
+   * (API.md, "Raw content policy"). So whenever our extension override — or
+   * the user's "Play as media…" — is the only reason we are here, say so
+   * before mounting an element that would just fire `error` seconds later.
+   */
+  const serverRefuses = !!entry && !serverStreamsInline(entry.mime);
 
   return (
     <div className={`player${kind === "video" ? " is-video" : ""}`}>
@@ -246,6 +277,26 @@ export function PlayerView({ path, sort, dir }: { path: string; sort: SortKey; d
             </a>
           </div>
         </div>
+      ) : serverRefuses ? (
+        <div className="player-stage">
+          <div className="player-card" data-testid="server-classification">
+            <div className="player-card-title">The server won’t stream this file</div>
+            <p className="player-card-body">{serverClassificationMessage(name, entry.mime)}</p>
+            <p className="muted small">
+              <code className="mono">fs/raw</code> serves only what the daemon itself classifies as{" "}
+              <code className="mono">video/*</code> or <code className="mono">audio/*</code> inline; anything else
+              arrives as an attachment, which no media element can play.
+            </p>
+            <div className="player-card-actions">
+              <a className="btn btn-primary" href={rawUrl(path, true)} download={name}>
+                Download file
+              </a>
+              <a className="btn" href={viewHref(path, "hex")}>
+                View as hex
+              </a>
+            </div>
+          </div>
+        </div>
       ) : (
         // Keyed on the path: a ↑/↓ swap gets a fresh element with the spinner,
         // failure and autoplay-blocked state reset, which is exactly what a new
@@ -254,8 +305,10 @@ export function PlayerView({ path, sort, dir }: { path: string; sort: SortKey; d
           key={path}
           path={path}
           name={name}
-          mime={entry.mime}
+          mime={mediaMimeFor(entry)}
           kind={kind}
+          onPrev={prev ? () => goTo(prev) : null}
+          onNext={next ? () => goTo(next) : null}
           canClose={canClose}
           onEnded={onEnded}
           hasPlaylist={playlist.length > 1}
@@ -274,6 +327,8 @@ function MediaStage({
   kind,
   canClose,
   onEnded,
+  onPrev,
+  onNext,
   hasPlaylist,
 }: {
   path: string;
@@ -282,10 +337,18 @@ function MediaStage({
   kind: MediaKind;
   canClose: boolean;
   onEnded: () => void;
+  /** null at the ends of the playlist — the menu item is then omitted. */
+  onPrev: (() => void) | null;
+  onNext: (() => void) | null;
   hasPlaylist: boolean;
 }) {
   const ref = useRef<HTMLVideoElement & HTMLAudioElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
+  // The menu's target is "was it paused when the menu opened" — the only thing
+  // the Play/Pause label needs, and sampling it here keeps `paused` out of
+  // React state (a re-render per play/pause event, on a control that is only
+  // ever read at right-click time, is not a trade worth making).
+  const { menu, openAt, close: closeMenu } = useContextMenu<boolean>();
 
   const verdict = useMemo(() => playability(kind, mime), [kind, mime]);
   // "no" refuses up front; mkv/mov answer "" but often play, so those attempt
@@ -327,6 +390,33 @@ function MediaStage({
     else void target.requestFullscreen?.();
   }, [kind]);
 
+  const togglePlay = useCallback(() => {
+    const el = ref.current;
+    if (!el) return;
+    if (el.paused) void el.play().catch(() => undefined);
+    else el.pause();
+    setAutoplayBlocked(false);
+  }, []);
+
+  /**
+   * The stage's own menu. The native <video> menu is suppressed only where
+   * ours opens, so a right-click anywhere else in the window (the header, the
+   * hints) still gets the browser's.
+   */
+  const menuItems = useMemo<MenuItem[]>(() => {
+    const items: MenuItem[] = [
+      { id: "playpause", label: menu?.target === false ? "Pause" : "Play", onSelect: togglePlay },
+    ];
+    if (onPrev) items.push({ id: "prev", label: "Previous", onSelect: onPrev });
+    if (onNext) items.push({ id: "next", label: "Next", onSelect: onNext });
+    items.push(
+      { id: "fullscreen", label: "Fullscreen", onSelect: () => toggleFullscreen() },
+      { id: "download", label: "Download", separatorBefore: true, onSelect: () => triggerDownload(path, name) },
+      { id: "copy-path", label: "Copy path", title: path, onSelect: () => void copyAndToast(path, "path") },
+    );
+    return items;
+  }, [menu?.target, name, onNext, onPrev, path, togglePlay, toggleFullscreen]);
+
   useEffect(() => {
     const onKey = (ev: KeyboardEvent) => {
       const el = ref.current;
@@ -339,9 +429,7 @@ function MediaStage({
           if (!el) return;
           // Handle it ourselves so a focused <video controls> does not toggle twice.
           ev.preventDefault();
-          if (el.paused) void el.play().catch(() => undefined);
-          else el.pause();
-          setAutoplayBlocked(false);
+          togglePlay();
           break;
         }
         case "ArrowLeft":
@@ -370,7 +458,7 @@ function MediaStage({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [canClose, path, toggleFullscreen]);
+  }, [canClose, path, togglePlay, toggleFullscreen]);
 
   if (failure) {
     return (
@@ -424,7 +512,14 @@ function MediaStage({
   };
 
   return (
-    <div className="player-stage" ref={stageRef}>
+    <div
+      className="player-stage"
+      ref={stageRef}
+      onContextMenu={(ev) => {
+        ev.preventDefault();
+        openAt(ev, ref.current?.paused ?? true);
+      }}
+    >
       {kind === "video" ? (
         // eslint-disable-next-line jsx-a11y/media-has-caption
         <video {...common} playsInline className="player-video" />
@@ -454,6 +549,10 @@ function MediaStage({
         {canClose ? <span>Esc close</span> : null}
         {!seekable ? <span className="player-hint-warn">archive entry — no seeking</span> : null}
       </div>
+
+      {menu ? (
+        <ContextMenu x={menu.x} y={menu.y} items={menuItems} onClose={closeMenu} label={`Player actions for ${name}`} />
+      ) : null}
     </div>
   );
 }

@@ -46,7 +46,16 @@ var extMime = map[string]string{
 	".mp4": "video/mp4", ".m4v": "video/mp4", ".mkv": "video/x-matroska",
 	".avi": "video/x-msvideo", ".mov": "video/quicktime", ".webm": "video/webm",
 	".wmv": "video/x-ms-wmv", ".flv": "video/x-flv", ".mpg": "video/mpeg",
-	".mpeg": "video/mpeg", ".m2ts": "video/mp2t",
+	".mpeg": "video/mpeg", ".m2ts": "video/mp2t", ".mts": "video/mp2t",
+	".mpe": "video/mpeg", ".m2v": "video/mpeg", ".ogv": "video/ogg", ".ogm": "video/ogg",
+	".3gp": "video/3gpp", ".3g2": "video/3gpp2", ".vob": "video/mpeg", ".divx": "video/x-msvideo",
+	".asf": "video/x-ms-asf", ".rm": "video/vnd.rn-realvideo", ".rmvb": "video/vnd.rn-realvideo",
+	".f4v": "video/mp4",
+	".oga": "audio/ogg", ".m4b": "audio/mp4", ".aif": "audio/aiff", ".aiff": "audio/aiff",
+	".alac": "audio/mp4", ".ape": "audio/x-ape", ".wv": "audio/x-wavpack", ".mka": "audio/x-matroska",
+	".dsf": "audio/x-dsf",
+	// NOTE: ".ts" stays text/plain (TypeScript is far more common on a NAS
+	// than raw MPEG-TS); the SPA's extension override still offers to play it.
 
 	// documents
 	".pdf": "application/pdf", ".rtf": "application/rtf", ".epub": "application/epub+zip",

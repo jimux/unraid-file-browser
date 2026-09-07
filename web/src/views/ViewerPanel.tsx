@@ -5,8 +5,18 @@ import { ErrorBanner, SkeletonBlock, Spinner } from "../components/Feedback";
 import { Icon } from "../components/Icon";
 import { useAsync } from "../hooks/useAsync";
 import { formatBytesExact, formatOffsetHex, formatSize } from "../lib/format";
-import { isMedia, mediaKind, openPlayer, playability, playerUrl } from "../lib/media";
+import {
+  isMedia,
+  mediaKind,
+  mediaMimeFor,
+  openPlayer,
+  playability,
+  playerUrl,
+  serverClassificationMessage,
+  serverStreamsInline,
+} from "../lib/media";
 import { basename, isVirtual } from "../lib/paths";
+import type { ViewTab } from "../lib/router";
 
 const TEXT_WINDOW = 262144; // API.md default; max 1048576
 const HEX_WINDOW = 4096; // API.md default; max 65536
@@ -32,28 +42,45 @@ function isInlineImage(mime: string | undefined): boolean {
   return INLINE_IMAGE_MIMES.has(mime.split(";")[0].trim().toLowerCase());
 }
 
-type Tab = "text" | "hex" | "image" | "media" | "download";
+type Tab = ViewTab;
 
-export function ViewerPanel({ path, onClose }: { path: string; onClose: () => void }) {
+/**
+ * `initialTab` comes from `#/view/<path>?tab=…` — the context menu's "View as
+ * text" / "View as hex" land here. Naming a tab *pins* it: the auto-defaulting
+ * below would otherwise flip an image or a video straight back off the tab the
+ * user explicitly asked for.
+ */
+export function ViewerPanel({
+  path,
+  initialTab,
+  onClose,
+}: {
+  path: string;
+  initialTab?: ViewTab | null;
+  onClose: () => void;
+}) {
   const entryState = useAsync<Entry>((signal) => stat(path, signal).then((r) => r.entry), [path]);
   const entry = entryState.data;
   const isImage = isInlineImage(entry?.mime);
-  const isPlayable = isMedia(entry?.mime);
+  const isPlayable = isMedia(entry?.mime, basename(path));
 
-  const [tab, setTab] = useState<Tab>("text");
-  const [tabPinned, setTabPinned] = useState(false);
+  /**
+   * The tab the *route* or the *user* asked for; null means "no opinion".
+   *
+   * The shown tab is derived from it rather than mirrored into state, because
+   * the default depends on `entry`, which arrives asynchronously *and* — since
+   * the extension override — can be knowable on the very first render. Two
+   * effects racing to write the same `tab` would then resolve by declaration
+   * order, which is not a contract worth relying on.
+   */
+  const [pinned, setPinned] = useState<Tab | null>(() => initialTab ?? null);
 
-  // Default to the richest tab the file supports, unless the user chose one.
   useEffect(() => {
-    if (tabPinned) return;
-    if (isImage) setTab("image");
-    else if (isPlayable) setTab("media");
-  }, [isImage, isPlayable, tabPinned]);
+    setPinned(initialTab ?? null);
+  }, [path, initialTab]);
 
-  useEffect(() => {
-    setTabPinned(false);
-    setTab("text");
-  }, [path]);
+  // Default to the richest tab the file supports, unless something pinned one.
+  const tab: Tab = pinned ?? (isImage ? "image" : isPlayable ? "media" : "text");
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -63,10 +90,7 @@ export function ViewerPanel({ path, onClose }: { path: string; onClose: () => vo
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
-  const pick = (t: Tab) => {
-    setTabPinned(true);
-    setTab(t);
-  };
+  const pick = (t: Tab) => setPinned(t);
 
   return (
     <section className="viewer" aria-label={`Viewer: ${basename(path)}`}>
@@ -116,7 +140,7 @@ export function ViewerPanel({ path, onClose }: { path: string; onClose: () => vo
         {tab === "text" ? <TextTab path={path} /> : null}
         {tab === "hex" ? <HexTab path={path} /> : null}
         {tab === "image" ? <ImageTab path={path} /> : null}
-        {tab === "media" ? <MediaTab path={path} mime={entry?.mime ?? ""} /> : null}
+        {tab === "media" ? <MediaTab path={path} entry={entry} /> : null}
         {tab === "download" ? <DownloadTab path={path} entry={entry} /> : null}
       </div>
     </section>
@@ -299,13 +323,24 @@ function ImageTab({ path }: { path: string }) {
  * dump. This tab is the launcher, plus a small in-panel preview so the user can
  * confirm the file is what they think before opening a window for it.
  */
-function MediaTab({ path, mime }: { path: string; mime: string }) {
-  const kind = mediaKind(mime) ?? "video";
+function MediaTab({ path, entry }: { path: string; entry: Entry | null }) {
+  const name = basename(path);
+  const reported = entry?.mime ?? "";
+  // What we hand canPlayType and the element: the reported type when it is
+  // honest, otherwise one synthesised from the extension.
+  const mime = useMemo(() => mediaMimeFor({ name, mime: reported }), [name, reported]);
+  const kind = mediaKind(reported, name) ?? "video";
   const verdict = useMemo(() => playability(kind, mime), [kind, mime]);
   const [failed, setFailed] = useState(false);
   useEffect(() => setFailed(false), [path]);
 
-  const unsupported = verdict === "no" || failed;
+  /**
+   * The extension says media but the *daemon* does not, so `fs/raw` will hand
+   * back an octet-stream attachment and no element can read it. Only trust
+   * `entry` here — while stat is in flight we have no reported mime to judge.
+   */
+  const serverRefuses = !!entry && !serverStreamsInline(reported);
+  const unsupported = !serverRefuses && (verdict === "no" || failed);
 
   return (
     <div className="tab-pane tab-media">
@@ -327,7 +362,9 @@ function MediaTab({ path, mime }: { path: string; mime: string }) {
       </div>
 
       <div className="muted small media-note">
-        {unsupported ? (
+        {serverRefuses ? (
+          <span className="media-note-warn">{serverClassificationMessage(name, reported)}</span>
+        ) : unsupported ? (
           <>
             Your browser can’t play <code className="mono">{mime || "this type"}</code> natively — download the file or
             use an external player. There is no server-side transcoding.
@@ -342,7 +379,7 @@ function MediaTab({ path, mime }: { path: string; mime: string }) {
         </div>
       </div>
 
-      {unsupported ? null : (
+      {unsupported || serverRefuses ? null : (
         <div className="media-preview">
           {kind === "video" ? (
             // eslint-disable-next-line jsx-a11y/media-has-caption

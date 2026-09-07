@@ -2,8 +2,9 @@
  * Hand-rolled hash router.
  *
  *   #/browse/<encodeURIComponent(path)>
- *   #/view/<encodeURIComponent(path)>     (viewer panel over the parent dir)
- *   #/play/<encodeURIComponent(path)>?sort=<key>&dir=<asc|desc>
+ *   #/view/<encodeURIComponent(path)>?tab=<text|hex|image|media|download>
+ *                                         (viewer panel over the parent dir)
+ *   #/play/<encodeURIComponent(path)>?sort=<key>&dir=<asc|desc>&force=1
  *                                         (standalone media player, own window)
  *   #/search?q=…&mode=…&…
  *   #/settings
@@ -28,12 +29,28 @@ export interface PlaySort {
 
 export const DEFAULT_PLAY_SORT: PlaySort = { sort: "name", dir: "asc" };
 
+/**
+ * `force` is the "Play as media…" escape hatch from the context menu: open the
+ * player for a file neither the mime nor the extension calls media, because
+ * the user knows better than both. It does *not* bypass the server's own
+ * classification — `fs/raw` still refuses to stream a non-media type inline,
+ * and the player says so.
+ */
+export interface PlayOptions extends Partial<PlaySort> {
+  force?: boolean;
+}
+
 const SORT_KEYS: readonly string[] = ["name", "size", "mtime", "type"];
+
+/** The viewer panel's tabs, in the order they render. */
+export type ViewTab = "text" | "hex" | "image" | "media" | "download";
+
+const VIEW_TABS: readonly string[] = ["text", "hex", "image", "media", "download"];
 
 export type Route =
   | { name: "browse"; path: string }
-  | { name: "view"; path: string }
-  | ({ name: "play"; path: string } & PlaySort)
+  | { name: "view"; path: string; tab: ViewTab | null }
+  | ({ name: "play"; path: string; force: boolean } & PlaySort)
   | { name: "search"; query: URLSearchParams }
   | { name: "settings" }
   | { name: "unknown" };
@@ -42,20 +59,29 @@ export function browseHref(path: string): string {
   return `#/browse/${encodeURIComponent(path)}`;
 }
 
-export function viewHref(path: string): string {
-  return `#/view/${encodeURIComponent(path)}`;
+/**
+ * `tab` is optional: omitting it keeps the viewer's own defaulting (image for
+ * an inline image, media for audio/video, text otherwise). Naming one pins it,
+ * which is what the context menu's "View as text"/"View as hex" want.
+ */
+export function viewHref(path: string, tab?: ViewTab | null): string {
+  const base = `#/view/${encodeURIComponent(path)}`;
+  return tab ? `${base}?tab=${tab}` : base;
 }
 
 /**
  * `sort` is optional: omitting it keeps the URL short and lets the player fall
  * back to name/asc, which is what a caller that has no sort of its own wants.
  */
-export function playHref(path: string, sort?: Partial<PlaySort> | null): string {
+export function playHref(path: string, opts?: PlayOptions | null): string {
   const base = `#/play/${encodeURIComponent(path)}`;
-  if (!sort || (!sort.sort && !sort.dir)) return base;
+  if (!opts || (!opts.sort && !opts.dir && !opts.force)) return base;
   const sp = new URLSearchParams();
-  sp.set("sort", sort.sort ?? DEFAULT_PLAY_SORT.sort);
-  sp.set("dir", sort.dir ?? DEFAULT_PLAY_SORT.dir);
+  if (opts.sort || opts.dir) {
+    sp.set("sort", opts.sort ?? DEFAULT_PLAY_SORT.sort);
+    sp.set("dir", opts.dir ?? DEFAULT_PLAY_SORT.dir);
+  }
+  if (opts.force) sp.set("force", "1");
   return `${base}?${sp.toString()}`;
 }
 
@@ -100,12 +126,14 @@ export function parseRoute(hash: string): Route {
       return { name: "browse", path: clampPathDepth(decodeSafe(segs.slice(1).join("/"))) || "/" };
     case "view": {
       const p = clampPathDepth(decodeSafe(segs.slice(1).join("/")));
-      return p ? { name: "view", path: p } : { name: "unknown" };
+      if (!p) return { name: "unknown" };
+      return { name: "view", path: p, tab: parseViewTab(new URLSearchParams(queryPart)) };
     }
     case "play": {
       const p = clampPathDepth(decodeSafe(segs.slice(1).join("/")));
       if (!p) return { name: "unknown" };
-      return { name: "play", path: p, ...parsePlaySort(new URLSearchParams(queryPart)) };
+      const q = new URLSearchParams(queryPart);
+      return { name: "play", path: p, force: q.get("force") === "1", ...parsePlaySort(q) };
     }
     case "search":
       return { name: "search", query: new URLSearchParams(queryPart) };
@@ -128,6 +156,16 @@ export function parsePlaySort(q: URLSearchParams): PlaySort {
     sort: sort && SORT_KEYS.includes(sort) ? (sort as SortKey) : DEFAULT_PLAY_SORT.sort,
     dir: dir === "desc" ? "desc" : "asc",
   };
+}
+
+/**
+ * Same shape as `parsePlaySort`: anything unrecognised collapses, here to
+ * `null`, which means "no opinion" — the viewer then picks its own default tab
+ * for the file rather than being pinned to a bogus one.
+ */
+export function parseViewTab(q: URLSearchParams): ViewTab | null {
+  const tab = q.get("tab");
+  return tab && VIEW_TABS.includes(tab) ? (tab as ViewTab) : null;
 }
 
 function decodeSafe(s: string): string {

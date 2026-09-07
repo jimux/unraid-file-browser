@@ -1817,3 +1817,77 @@ mark {
   gap: 8px;
   align-items: center;
 }
+
+/* ============================================================ context menu */
+
+/*
+   Fixed-positioned so it escapes the virtualised grid's scroll container
+   without a portal. The view clamps left/top to the viewport after measuring,
+   so the only thing left to guard here is a menu taller than the window.
+*/
+.ctxmenu {
+  position: fixed;
+  z-index: 60;
+  min-width: 186px;
+  max-height: calc(100vh - 12px);
+  overflow-y: auto;
+  padding: 4px 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  font-size: 12px;
+}
+
+.ctxmenu-item {
+  appearance: none;
+  display: block;
+  width: 100%;
+  padding: 5px 14px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  white-space: nowrap;
+  cursor: default;
+}
+
+.ctxmenu-item.is-active,
+.ctxmenu-item:hover,
+.ctxmenu-item:focus-visible {
+  background: var(--accent);
+  color: var(--accent-text);
+  outline: none;
+}
+
+.ctxmenu-item.has-sep {
+  margin-top: 5px;
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
+}
+
+/* ==================================================================== toast */
+
+.toast {
+  position: fixed;
+  z-index: 70;
+  left: 50%;
+  bottom: 26px;
+  transform: translateX(-50%);
+  padding: 6px 14px;
+  border-radius: 12px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface-3);
+  color: var(--text);
+  font-size: 12px;
+  box-shadow: var(--shadow);
+  pointer-events: none;
+}
+
+/* The daemon refused to stream a file the SPA called media by extension. */
+.media-note-warn {
+  color: var(--warn);
+}

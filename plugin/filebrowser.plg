@@ -27,6 +27,9 @@
 ##File Browser
 
 ###2026.09.07c
+- Right-click context menu on files, folders and archives (open, play, view as text/hex, details, download, copy path/name); also in search results and the player
+- Known video/audio extensions are treated as media regardless of the reported type; "Play as media" on any file
+- Daemon recognises many more video/audio extensions (3gp, ogv, vob, mts, m4b, aiff, mka, ...)
 - Fix: the web app could stay stale in the browser after a plugin update (cached index.html); the page now cache-busts on the installed version
 
 ###2026.09.07b

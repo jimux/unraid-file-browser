@@ -4,7 +4,9 @@ import type { Entry, SortDir, SortKey } from "../api/types";
 import { useDirListing } from "../hooks/useDirListing";
 import { EmptyState, ErrorBanner, SkeletonRows, Spinner } from "../components/Feedback";
 import { EntryIcon } from "../components/Icon";
+import { ContextMenu, isMenuKey, useContextMenu } from "../components/ContextMenu";
 import { formatAbsolute, formatBytesExact, formatRelative, formatSize, typeLabel } from "../lib/format";
+import { buildEntryMenu } from "../lib/entryMenu";
 import { isMedia } from "../lib/media";
 import { parentPath } from "../lib/paths";
 
@@ -54,6 +56,7 @@ export function BrowserView({
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [selected, setSelected] = useState(0);
+  const { menu, openAt, openAtElement, close: closeMenu } = useContextMenu<Entry>();
 
   // External reload button.
   const reloadRef = useRef(reloadNonce);
@@ -66,8 +69,9 @@ export function BrowserView({
 
   useEffect(() => {
     setSelected(0);
+    closeMenu();
     scrollRef.current?.scrollTo({ top: 0 });
-  }, [path, sort.key, sort.dir, sort.dirsFirst]);
+  }, [path, sort.key, sort.dir, sort.dirsFirst, closeMenu]);
 
   // Keyboard nav needs the grid focused; give it focus on arrival so arrows /
   // Enter / Backspace work without a click first (never while the viewer is up,
@@ -106,6 +110,33 @@ export function BrowserView({
     [onNavigate, onOpenFile],
   );
 
+  /**
+   * Right-clicking a row selects it first: the menu acts on one entry, and
+   * leaving the highlight somewhere else while the menu talks about this file
+   * is exactly how people delete the wrong thing in other file managers.
+   */
+  const onRowContextMenu = useCallback(
+    (ev: React.MouseEvent, index: number, e: Entry) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      setSelected(index);
+      openAt(ev, e);
+    },
+    [openAt],
+  );
+
+  const menuItems = useMemo(
+    () =>
+      menu
+        ? buildEntryMenu(menu.target, {
+            open: activate,
+            details: onOpenDetails,
+            playSort: { sort: sort.key, dir: sort.dir },
+          })
+        : [],
+    [menu, activate, onOpenDetails, sort.key, sort.dir],
+  );
+
   const move = useCallback(
     (delta: number) => {
       setSelected((cur) => {
@@ -120,6 +151,13 @@ export function BrowserView({
   const onKeyDown = useCallback(
     (ev: React.KeyboardEvent<HTMLDivElement>) => {
       if (inert) return;
+      if (isMenuKey(ev)) {
+        const e = entries[selected];
+        if (!e) return;
+        ev.preventDefault();
+        openAtElement(scrollRef.current?.querySelector(`[aria-rowindex="${selected + 1}"]`), e);
+        return;
+      }
       switch (ev.key) {
         case "ArrowDown":
           ev.preventDefault();
@@ -175,7 +213,7 @@ export function BrowserView({
           break;
       }
     },
-    [activate, entries, inert, move, onNavigate, onOpenDetails, path, selected],
+    [activate, entries, inert, move, onNavigate, onOpenDetails, openAtElement, path, selected],
   );
 
   const toggleSort = (key: SortKey) => {
@@ -219,6 +257,7 @@ export function BrowserView({
         role="grid"
         aria-rowcount={total || entries.length}
         onKeyDown={onKeyDown}
+        onScroll={menu ? closeMenu : undefined}
       >
         {loading && entries.length === 0 ? (
           <SkeletonRows rows={18} cols={4} />
@@ -230,7 +269,7 @@ export function BrowserView({
               const e = entries[vi.index];
               if (!e) return null;
               const isSel = vi.index === selected;
-              const media = e.type === "file" && isMedia(e.mime);
+              const media = e.type === "file" && isMedia(e.mime, e.name);
               return (
                 <div
                   key={`${e.path}-${vi.index}`}
@@ -240,6 +279,7 @@ export function BrowserView({
                   style={{ transform: `translateY(${vi.start}px)`, height: `${ROW_HEIGHT}px` }}
                   onClick={() => setSelected(vi.index)}
                   onDoubleClick={() => activate(e)}
+                  onContextMenu={(ev) => onRowContextMenu(ev, vi.index, e)}
                   onKeyDown={undefined}
                 >
                   <div className="td col-name" title={e.path}>
@@ -296,8 +336,18 @@ export function BrowserView({
           {total > entries.length ? ` of ${total.toLocaleString()}` : ""} item{total === 1 ? "" : "s"}
         </span>
         {loadingMore ? <Spinner label="loading more…" /> : null}
-        <span className="foot-hint">↑↓ move · Enter open · ⇧Enter details · Backspace up</span>
+        <span className="foot-hint">↑↓ move · Enter open · ⇧Enter details · ⇧F10 menu · Backspace up</span>
       </footer>
+
+      {menu ? (
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          items={menuItems}
+          onClose={closeMenu}
+          label={`Actions for ${menu.target.name}`}
+        />
+      ) : null}
     </section>
   );
 }

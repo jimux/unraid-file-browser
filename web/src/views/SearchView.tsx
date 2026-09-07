@@ -1,12 +1,14 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError, search as apiSearch } from "../api/client";
-import type { SearchMode, SearchResult } from "../api/types";
+import type { Entry, SearchMode, SearchResult } from "../api/types";
 import { EmptyState, ErrorBanner, SkeletonRows, Spinner } from "../components/Feedback";
 import { EntryIcon, Icon } from "../components/Icon";
+import { ContextMenu, isMenuKey, useContextMenu } from "../components/ContextMenu";
 import { useDebounced } from "../hooks/useAsync";
 import { formatAbsolute, formatRelative, formatSize } from "../lib/format";
+import { buildEntryMenu } from "../lib/entryMenu";
 import { dirOf } from "../lib/paths";
-import { SETTINGS_HREF, searchHref, syncUrlSilently } from "../lib/router";
+import { SETTINGS_HREF, navigate, searchHref, syncUrlSilently, viewHref } from "../lib/router";
 import { sanitizeSnippet } from "../lib/sanitize";
 
 const PAGE = 100;
@@ -83,13 +85,30 @@ export function SearchView({
   params: URLSearchParams;
   currentDir: string;
   onNavigate: (p: string) => void;
-  onOpenFile: (p: string, mime?: string) => void;
+  onOpenFile: (p: string, mime?: string, name?: string) => void;
 }) {
   const [form, setForm] = useState<FormState>(() => initialForm(params, currentDir));
   const [result, setResult] = useState<SearchResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<ApiError | null>(null);
   const [offset, setOffset] = useState(0);
+  const { menu, openAt, openAtElement, close: closeMenu } = useContextMenu<Entry>();
+
+  /**
+   * The results have no sort of their own (relevance order is not something
+   * `fs/list` can reproduce), so the player gets the daemon's name/asc default
+   * for its ↑/↓ — the same thing a click on the hit name already does.
+   */
+  const openHit = useCallback(
+    (e: Entry) => (e.type === "dir" || e.type === "archive" ? onNavigate(e.path) : onOpenFile(e.path, e.mime, e.name)),
+    [onNavigate, onOpenFile],
+  );
+
+  const menuItems = useMemo(
+    () =>
+      menu ? buildEntryMenu(menu.target, { open: openHit, details: (e) => navigate(viewHref(e.path)) }) : [],
+    [menu, openHit],
+  );
 
   const set = <K extends keyof FormState>(k: K, v: FormState[K]) =>
     setForm((f) => ({ ...f, [k]: v }));
@@ -323,14 +342,26 @@ export function SearchView({
           const e = hit.entry;
           const dir = dirOf(e.path);
           return (
-            <article className="hit" key={`${e.path}-${hit.score}`}>
+            <article
+              className="hit"
+              key={`${e.path}-${hit.score}`}
+              onContextMenu={(ev) => {
+                ev.preventDefault();
+                openAt(ev, e);
+              }}
+              onKeyDown={(ev) => {
+                if (!isMenuKey(ev)) return;
+                ev.preventDefault();
+                openAtElement(ev.currentTarget, e);
+              }}
+            >
               <div className="hit-main">
                 <EntryIcon type={e.type} />
                 <button
                   type="button"
                   className="hit-name"
                   title={e.path}
-                  onClick={() => (e.type === "dir" || e.type === "archive" ? onNavigate(e.path) : onOpenFile(e.path, e.mime))}
+                  onClick={() => openHit(e)}
                 >
                   {e.name}
                 </button>
@@ -378,6 +409,16 @@ export function SearchView({
             Next ›
           </button>
         </div>
+      ) : null}
+
+      {menu ? (
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          items={menuItems}
+          onClose={closeMenu}
+          label={`Actions for ${menu.target.name}`}
+        />
       ) : null}
     </section>
   );

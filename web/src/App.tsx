@@ -12,7 +12,7 @@ import { useRoute } from "./hooks/useRoute";
 import { useTheme } from "./hooks/useTheme";
 import { isMedia, openPlayer } from "./lib/media";
 import { browseHref, navigate, viewHref } from "./lib/router";
-import { parentPath } from "./lib/paths";
+import { basename, parentPath } from "./lib/paths";
 
 const FALLBACK_ROOTS = ["/mnt/user"];
 
@@ -77,8 +77,8 @@ export default function App() {
    * blocked); everything else opens the viewer panel. `mime` is optional so a
    * caller that only has a path still gets the viewer.
    */
-  const openFile = useCallback((p: string, mime?: string) => {
-    if (isMedia(mime)) openPlayer(p);
+  const openFile = useCallback((p: string, mime?: string, name?: string) => {
+    if (isMedia(mime, name ?? basename(p))) openPlayer(p);
     else navigate(viewHref(p));
   }, []);
 
@@ -91,7 +91,7 @@ export default function App() {
    */
   const openEntry = useCallback(
     (e: Entry) => {
-      if (isMedia(e.mime)) openPlayer(e.path, { sort: sort.key, dir: sort.dir });
+      if (isMedia(e.mime, e.name)) openPlayer(e.path, { sort: sort.key, dir: sort.dir });
       else navigate(viewHref(e.path));
     },
     [sort.key, sort.dir],
@@ -103,7 +103,8 @@ export default function App() {
   const mode: ViewMode = route.name === "search" ? "search" : route.name === "settings" ? "settings" : "browse";
   const showBrowser = route.name === "browse" || route.name === "view" || route.name === "unknown";
 
-  if (route.name === "play") return <PlayerView path={route.path} sort={route.sort} dir={route.dir} />;
+  if (route.name === "play")
+    return <PlayerView path={route.path} sort={route.sort} dir={route.dir} force={route.force} />;
 
   return (
     <div className="app">
@@ -125,7 +126,9 @@ export default function App() {
                 reloadNonce={reloadNonce}
                 inert={route.name === "view"}
               />
-              {route.name === "view" ? <ViewerPanel path={route.path} onClose={closeViewer} /> : null}
+              {route.name === "view" ? (
+                <ViewerPanel path={route.path} initialTab={route.tab} onClose={closeViewer} />
+              ) : null}
             </>
           ) : null}
 
