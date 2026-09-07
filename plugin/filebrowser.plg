@@ -1,0 +1,206 @@
+<?xml version='1.0' standalone='yes'?>
+
+<!DOCTYPE PLUGIN [
+<!ENTITY name "filebrowser">
+<!ENTITY author "James Smyth">
+<!ENTITY version "0000.00.00">
+<!ENTITY md5 "00000000000000000000000000000000">
+<!ENTITY launch "Tools/FileBrowser">
+<!ENTITY github "jimux/unraid-file-browser">
+<!ENTITY plugdir "/usr/local/emhttp/plugins/&name;">
+<!ENTITY bootdir "/boot/config/plugins/&name;">
+<!ENTITY package "&name;-&version;-x86_64-1.txz">
+<!ENTITY pluginURL "https://github.com/&github;/releases/latest/download/&name;.plg">
+<!ENTITY packageURL "https://github.com/&github;/releases/download/v&version;/&package;">
+]>
+
+<PLUGIN name="&name;"
+        author="&author;"
+        version="&version;"
+        launch="&launch;"
+        pluginURL="&pluginURL;"
+        support="https://github.com/&github;/issues"
+        icon="folder-open-o"
+        min="6.12.0">
+
+<CHANGES>
+##File Browser
+
+###2026.09.01
+- Initial release
+- Array-wide file browser with name/metadata/content search (SQLite FTS5)
+- In-browser viewer with selectable text encodings, hex view and image preview
+- Read-only browsing inside archives (zip, tar.*, 7z, iso, rar, ...) via bundled 7zz
+- Read-only: no endpoint in this release mutates user data
+</CHANGES>
+
+<!--
+File Browser for Unraid
+Copyright 2026, James Smyth
+
+Layout installed by the package (see plugin/README.md for the full contract):
+
+  /usr/local/emhttp/plugins/filebrowser/       webGUI pages, proxy.php, rc script, events
+  /usr/local/emhttp/plugins/filebrowser/app/   built React SPA (served by emhttp's nginx)
+  /usr/local/sbin/filebrowserd                 daemon binary (unix socket only)
+  /usr/local/sbin/7zz                          bundled static 7-Zip, used by the archive reader
+  /boot/config/plugins/filebrowser/            persistent settings (settings.cfg) - survives upgrades
+
+The 'version' and 'md5' entity declarations above are rewritten in place by
+`make package` (see the Makefile) with a literal sed pattern, so those two
+lines must keep exactly one space between the entity name and its quoted
+value. Do not realign them with the others.
+-->
+
+<!--
+The 'source' package. Downloaded to the flash drive and verified against the
+MD5 that `make package` stamped into the manifest. It is deliberately NOT run
+here: the install script below has to stop a running daemon first.
+-->
+<FILE Name="&bootdir;/&package;">
+<URL>&packageURL;</URL>
+<MD5>&md5;</MD5>
+</FILE>
+
+<!--
+The 'install' script.
+-->
+<FILE Run="/bin/bash">
+<INLINE>
+PLUGIN="&name;"
+VERSION="&version;"
+<![CDATA[
+BOOT="/boot/config/plugins/${PLUGIN}"
+PLUGDIR="/usr/local/emhttp/plugins/${PLUGIN}"
+RC="${PLUGDIR}/rc.filebrowserd"
+CFG="${BOOT}/settings.cfg"
+
+# The entity above is expanded by the plugin manager. If a future XML parser
+# ever hands the CDATA through unexpanded, fall back to the newest package that
+# was staged on the flash drive so the install still resolves a real file.
+case "${VERSION}" in
+  ''|*'&'*)
+    VERSION=$(ls -1 "${BOOT}/${PLUGIN}"-*-x86_64-1.txz 2>/dev/null \
+              | sed -n "s|.*/${PLUGIN}-\(.*\)-x86_64-1.txz|\1|p" | sort | tail -1)
+    ;;
+esac
+PKG="${BOOT}/${PLUGIN}-${VERSION}-x86_64-1.txz"
+
+if [ ! -f "${PKG}" ]; then
+  echo "ERROR: package ${PKG} not found on the flash drive"
+  exit 1
+fi
+
+# --- stop a running daemon before the binary is replaced ------------------
+if [ -x "${RC}" ]; then
+  echo "Stopping filebrowserd ..."
+  "${RC}" stop || true
+fi
+
+# --- install -------------------------------------------------------------
+upgradepkg --install-new "${PKG}"
+if [ $? -ne 0 ]; then
+  echo "ERROR: upgradepkg failed for ${PKG}"
+  exit 1
+fi
+
+# --- prune superseded packages from the flash drive ----------------------
+for old in "${BOOT}/${PLUGIN}"-*-x86_64-1.txz; do
+  [ -f "${old}" ] || continue
+  [ "${old}" = "${PKG}" ] && continue
+  echo "Removing old package $(basename "${old}")"
+  rm -f "${old}"
+done
+
+# --- persistent configuration -------------------------------------------
+mkdir -p "${BOOT}"
+if [ ! -f "${CFG}" ] && [ -f "${PLUGDIR}/default.cfg" ]; then
+  cp "${PLUGDIR}/default.cfg" "${CFG}"
+fi
+
+chmod 0755 "${RC}" 2>/dev/null
+chmod 0755 "${PLUGDIR}"/event/* 2>/dev/null
+
+# --- start the service if the array is up and autostart is enabled -------
+# settings.cfg is written by the webGUI's /update.php straight from POST
+# fields, so it is DATA, not script, and is NEVER sourced: sourcing it would
+# execute whatever a field value contained, as root, during install. The same
+# literal sed extraction rc.filebrowserd uses is duplicated here because the
+# rc script is not guaranteed to be in place yet at this point.
+fb_cfg_get() {
+  local key="$1" file val out=""
+  shift
+  for file in "$@"; do
+    [ -r "${file}" ] || continue
+    val=$(sed -n "s/^${key}=\"\([^\"]*\)\"[[:space:]]*\$/\1/p" "${file}" 2>/dev/null \
+          | tr -d '\r' | head -1)
+    [ -n "${val}" ] && out="${val}"
+  done
+  printf '%s' "${out}"
+}
+
+SERVICE=$(fb_cfg_get SERVICE "${PLUGDIR}/default.cfg" "${CFG}")
+# Same normalisation rc.filebrowserd applies, so install and boot agree.
+case "${SERVICE}" in enable|disable) ;; *) SERVICE="enable" ;; esac
+
+FSSTATE=$(grep -Po '^fsState="\K[^"]*' /var/local/emhttp/var.ini 2>/dev/null)
+
+if [ "${SERVICE}" = "enable" ] && [ "${FSSTATE}" = "Started" ]; then
+  echo "Starting filebrowserd ..."
+  "${RC}" start || true
+elif [ "${SERVICE}" = "enable" ]; then
+  echo "Array is not started - filebrowserd will start on the next array start."
+else
+  echo "Autostart is disabled - start filebrowserd from Settings > File Browser."
+fi
+
+echo ""
+echo "-----------------------------------------------------------"
+echo " ${PLUGIN} has been installed."
+echo " Copyright 2026, James Smyth"
+echo " Version: ${VERSION}"
+echo "-----------------------------------------------------------"
+echo ""
+]]>
+</INLINE>
+</FILE>
+
+<!--
+The 'remove' script. Deliberately leaves /boot/config/plugins/filebrowser
+(settings) and the index/data directory on the array untouched.
+-->
+<FILE Run="/bin/bash" Method="remove">
+<INLINE>
+PLUGIN="&name;"
+<![CDATA[
+PLUGDIR="/usr/local/emhttp/plugins/${PLUGIN}"
+RC="${PLUGDIR}/rc.filebrowserd"
+
+# --- stop the daemon -----------------------------------------------------
+if [ -x "${RC}" ]; then
+  "${RC}" stop || true
+fi
+rm -f /var/run/filebrowserd.sock /var/run/filebrowserd.pid
+
+# --- remove the Slackware package ---------------------------------------
+# Version independent: remove every installed filebrowser-<version> package.
+for pkg in /var/log/packages/${PLUGIN}-*; do
+  [ -e "${pkg}" ] || continue
+  removepkg "$(basename "${pkg}")"
+done
+
+# --- remove what is left of the webGUI tree -----------------------------
+rm -rf "${PLUGDIR}"
+
+echo ""
+echo "-----------------------------------------------------------"
+echo " ${PLUGIN} has been uninstalled."
+echo " Settings under /boot/config/plugins/${PLUGIN} were kept."
+echo " The search index in the configured data directory was kept."
+echo "-----------------------------------------------------------"
+echo ""
+]]>
+</INLINE>
+</FILE>
+
+</PLUGIN>

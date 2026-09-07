@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      Defence in depth for a page that renders untrusted filenames and search
+      snippets. Everything the SPA needs is same-origin: the bundle, the CSS,
+      images from ../proxy.php, and the SSE/fetch calls to the same bridge.
+      'unsafe-inline' is required for style-src only because React writes inline
+      style attributes (progress bars, virtual-list transforms). Vite emits the
+      bundle as an external module with no inline script of any kind, so
+      script-src stays strict — keep it that way.
+
+      NOTE: frame-ancestors is deliberately absent — browsers ignore that
+      directive when it arrives in a meta element and log a console warning for
+      it. The plugin must send it as a real HTTP header instead.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; media-src 'self'; object-src 'none'; base-uri 'none'"
+    />
+    <!-- Inline so the iframe never requests a /favicon.ico the plugin doesn't ship. -->
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='%23ff8c2f' d='M1.5 3.5A1.5 1.5 0 0 1 3 2h3.2l1.2 1.5H13A1.5 1.5 0 0 1 14.5 5v6.5A1.5 1.5 0 0 1 13 13H3a1.5 1.5 0 0 1-1.5-1.5v-8Z'/%3E%3C/svg%3E"
+    />
+    <title>File Browser</title>
+  </head>
+  <body class="theme-white">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

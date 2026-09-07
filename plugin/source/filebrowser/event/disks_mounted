@@ -1,0 +1,44 @@
+#!/bin/bash
+#
+# emhttp event: disks_mounted
+#
+# Fired once the array disks are mounted and /mnt/user exists - the point at
+# which the configured data directory (default /mnt/user/appdata/filebrowser)
+# becomes writable, so the index database can be opened. This is the same hook
+# Unassigned Devices uses to automount, and it runs before 'started'.
+#
+# Honours the autostart setting; a user who turned it off starts the daemon by
+# hand from Settings > User Utilities > File Browser Settings.
+#
+# settings.cfg is written by the webGUI's /update.php from POST fields, so it
+# is DATA, not script: it is never sourced. The same literal sed extraction
+# rc.filebrowserd uses (fb_cfg_get) is duplicated here - this hook may run
+# before/without the rc script being readable, and three lines of sed are
+# cheaper than a sourcing accident. rc.filebrowserd re-validates everything it
+# uses anyway.
+
+PLUGIN="filebrowser"
+PLUGDIR="/usr/local/emhttp/plugins/${PLUGIN}"
+CFG="/boot/config/plugins/${PLUGIN}/settings.cfg"
+
+fb_cfg_get() {
+  local key="$1" file val out=""
+  shift
+  for file in "$@"; do
+    [ -r "${file}" ] || continue
+    val=$(sed -n "s/^${key}=\"\([^\"]*\)\"[[:space:]]*\$/\1/p" "${file}" 2>/dev/null \
+          | tr -d '\r' | head -1)
+    [ -n "${val}" ] && out="${val}"
+  done
+  printf '%s' "${out}"
+}
+
+SERVICE=$(fb_cfg_get SERVICE "${PLUGDIR}/default.cfg" "${CFG}")
+# Same normalisation rc.filebrowserd applies, so install and boot agree.
+case "${SERVICE}" in enable|disable) ;; *) SERVICE="enable" ;; esac
+
+[ "${SERVICE}" = "enable" ] || exit 0
+[ -x "${PLUGDIR}/rc.filebrowserd" ] || exit 0
+
+"${PLUGDIR}/rc.filebrowserd" start 2>&1 | logger -t "${PLUGIN}"
+exit 0

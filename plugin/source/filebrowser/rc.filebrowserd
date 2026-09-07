@@ -1,0 +1,262 @@
+#!/bin/bash
+#
+# rc.filebrowserd - service control for the File Browser daemon
+#
+# Copyright 2026, James Smyth
+#
+# Licensed under the MIT License; see the LICENSE file in the project root.
+#
+# Usage: rc.filebrowserd start|stop|restart|status
+#
+# The daemon listens only on a root-owned unix socket. Nothing is bound to a
+# TCP port, so nothing is exposed on the LAN; the webGUI reaches it through
+# /usr/local/emhttp/plugins/filebrowser/proxy.php, which runs behind Unraid's
+# own authentication.
+#
+# ---------------------------------------------------------------------------
+# SETTINGS ARE NEVER SOURCED.
+# ---------------------------------------------------------------------------
+# settings.cfg is written by the webGUI's /update.php, which copies POST field
+# names and values into it verbatim. Sourcing that file would run every line as
+# root - DATA_DIR="/x$(id)" or an injected BIN=... line would be arbitrary code
+# execution at the next array start. So the values are *read* with a literal
+# sed extraction (fb_cfg_get) and every one of them is validated before use;
+# anything unexpected is logged and replaced with the shipped default. Any key
+# we do not read is inert.
+
+PLUGIN="filebrowser"
+PLUGDIR="/usr/local/emhttp/plugins/${PLUGIN}"
+BOOTDIR="/boot/config/plugins/${PLUGIN}"
+CFG="${BOOTDIR}/settings.cfg"
+DEFAULTS="${PLUGDIR}/default.cfg"
+
+BIN="/usr/local/sbin/filebrowserd"
+SOCKET="/var/run/filebrowserd.sock"
+PIDFILE="/var/run/filebrowserd.pid"
+LOGFILE="/var/log/filebrowserd.log"
+
+DEFAULT_DATA_DIR="/mnt/user/appdata/filebrowser"
+DEFAULT_BROWSE_ROOTS="/mnt/user"
+
+# A single absolute path. Deliberately narrow: letters, digits, dot, underscore,
+# at-sign, dash, slash and space are enough for every real share name.
+FB_ABS_RE='^/[A-Za-z0-9._@/ -]+$'
+# One element of BROWSE_ROOTS. Same class, but may be "/" on its own.
+FB_ROOT_RE='^/[A-Za-z0-9._@/ -]*$'
+
+FB_PID=""
+
+log() {
+  echo "$*"
+  logger -t "${PLUGIN}" -- "$*" 2>/dev/null
+}
+
+# Config problems have to be visible even when nobody is watching a terminal:
+# the daemon log is where the settings page points the user.
+logcfg() {
+  log "$*"
+  echo "$(date '+%Y-%m-%d %H:%M:%S') rc.filebrowserd: $*" >> "${LOGFILE}" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# fb_cfg_get KEY FILE... - value of KEY="..." from the last file that has it.
+#
+# The whole point of this function is that the file is DATA, never script: sed
+# extracts the quoted value and nothing is ever evaluated. KEY is always a
+# literal from this file, so it cannot smuggle a sed expression either.
+# ---------------------------------------------------------------------------
+fb_cfg_get() {
+  local key="$1" file val out=""
+  shift
+  for file in "$@"; do
+    [ -r "${file}" ] || continue
+    val=$(sed -n "s/^${key}=\"\([^\"]*\)\"[[:space:]]*\$/\1/p" "${file}" 2>/dev/null \
+          | tr -d '\r' | head -1)
+    [ -n "${val}" ] && out="${val}"
+  done
+  printf '%s' "${out}"
+}
+
+# Every element of a comma-separated list must be an acceptable absolute path.
+fb_valid_roots() {
+  local list="$1" item rest
+  [ -n "${list}" ] || return 1
+  case "${list}" in *,) return 1 ;; esac
+  rest="${list}"
+  while [ -n "${rest}" ]; do
+    case "${rest}" in
+      *,*) item="${rest%%,*}"; rest="${rest#*,}" ;;
+      *)   item="${rest}";     rest="" ;;
+    esac
+    [ -n "${item}" ] || return 1
+    [[ "${item}" =~ $FB_ROOT_RE ]] || return 1
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# settings: plugin defaults first, then the user's copy on the flash drive
+# ---------------------------------------------------------------------------
+SERVICE=$(fb_cfg_get SERVICE "${DEFAULTS}" "${CFG}")
+DATA_DIR=$(fb_cfg_get DATA_DIR "${DEFAULTS}" "${CFG}")
+BROWSE_ROOTS=$(fb_cfg_get BROWSE_ROOTS "${DEFAULTS}" "${CFG}")
+
+if [ "${SERVICE}" != "enable" ] && [ "${SERVICE}" != "disable" ]; then
+  [ -n "${SERVICE}" ] && logcfg "ignoring invalid SERVICE in ${CFG}; using \"enable\""
+  SERVICE="enable"
+fi
+
+# A relative, empty or otherwise unexpected DATA_DIR would put the index
+# somewhere unpredictable (the daemon is started from an arbitrary cwd), so
+# refuse it. "/" is refused too - the index must live in its own directory.
+if [ "${DATA_DIR}" = "/" ] || ! [[ "${DATA_DIR}" =~ $FB_ABS_RE ]]; then
+  [ -n "${DATA_DIR}" ] && logcfg "ignoring invalid DATA_DIR in ${CFG}; using ${DEFAULT_DATA_DIR}"
+  DATA_DIR="${DEFAULT_DATA_DIR}"
+fi
+
+if ! fb_valid_roots "${BROWSE_ROOTS}"; then
+  [ -n "${BROWSE_ROOTS}" ] && logcfg "ignoring invalid BROWSE_ROOTS in ${CFG}; using ${DEFAULT_BROWSE_ROOTS}"
+  BROWSE_ROOTS="${DEFAULT_BROWSE_ROOTS}"
+fi
+
+# ---------------------------------------------------------------------------
+# running - true when the pidfile names a live process. Clears a stale pidfile.
+# ---------------------------------------------------------------------------
+running() {
+  local pid
+  FB_PID=""
+  if [ -f "${PIDFILE}" ]; then
+    pid=$(cat "${PIDFILE}" 2>/dev/null)
+    case "${pid}" in
+      ''|*[!0-9]*) ;;
+      *)
+        if kill -0 "${pid}" 2>/dev/null; then
+          FB_PID="${pid}"
+          return 0
+        fi
+        ;;
+    esac
+    rm -f "${PIDFILE}"
+  fi
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+start() {
+  if running; then
+    echo "filebrowserd is already running (pid ${FB_PID})"
+    return 0
+  fi
+
+  if [ ! -x "${BIN}" ]; then
+    log "cannot start: ${BIN} is missing or not executable"
+    return 1
+  fi
+
+  # A socket left behind by a crash makes bind() fail with EADDRINUSE.
+  if [ -e "${SOCKET}" ]; then
+    rm -f "${SOCKET}"
+  fi
+
+  if ! mkdir -p "${DATA_DIR}" 2>/dev/null; then
+    # Not fatal: the daemon starts degraded-but-alive so the UI can explain
+    # why (typically the array is not mounted yet).
+    log "warning: data directory ${DATA_DIR} could not be created"
+  fi
+
+  touch "${LOGFILE}" 2>/dev/null
+  log "starting filebrowserd (data ${DATA_DIR}, roots ${BROWSE_ROOTS})"
+
+  # -roots is the authoritative browse/search confinement and is a boot-time
+  # setting on purpose: it is not reachable from the API, so nothing the webGUI
+  # (or anything that reaches it) can do widens it to "/". Comma-separated
+  # list, validated above.
+  nohup "${BIN}" -socket "${SOCKET}" -data "${DATA_DIR}" -roots "${BROWSE_ROOTS}" >> "${LOGFILE}" 2>&1 &
+  echo $! > "${PIDFILE}"
+
+  # Wait up to ~10s for the socket to appear so callers (webGUI buttons, the
+  # install script, the array-start event) get a truthful exit status.
+  local i
+  for i in $(seq 1 50); do
+    [ -S "${SOCKET}" ] && break
+    running || break
+    sleep 0.2
+  done
+
+  if running && [ -S "${SOCKET}" ]; then
+    echo "filebrowserd started (pid ${FB_PID})"
+    return 0
+  fi
+
+  log "filebrowserd failed to start - see ${LOGFILE}"
+  rm -f "${PIDFILE}"
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+stop() {
+  if ! running; then
+    echo "filebrowserd is not running"
+    rm -f "${SOCKET}"
+    return 0
+  fi
+
+  local pid="${FB_PID}" i
+  log "stopping filebrowserd (pid ${pid})"
+  kill -TERM "${pid}" 2>/dev/null
+
+  # Give it 10s to flush the index and close the socket.
+  for i in $(seq 1 100); do
+    kill -0 "${pid}" 2>/dev/null || break
+    sleep 0.1
+  done
+
+  if kill -0 "${pid}" 2>/dev/null; then
+    log "filebrowserd did not exit on SIGTERM - sending SIGKILL"
+    kill -KILL "${pid}" 2>/dev/null
+    for i in $(seq 1 20); do
+      kill -0 "${pid}" 2>/dev/null || break
+      sleep 0.1
+    done
+  fi
+
+  rm -f "${PIDFILE}" "${SOCKET}"
+
+  if kill -0 "${pid}" 2>/dev/null; then
+    log "filebrowserd (pid ${pid}) could not be stopped"
+    return 1
+  fi
+
+  echo "filebrowserd stopped"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+status() {
+  if running; then
+    echo "filebrowserd is running (pid ${FB_PID})"
+    if [ -S "${SOCKET}" ]; then
+      echo "socket: ${SOCKET}"
+    else
+      echo "socket: ${SOCKET} is MISSING"
+    fi
+    echo "data:   ${DATA_DIR}"
+    echo "roots:  ${BROWSE_ROOTS}"
+    return 0
+  fi
+  echo "filebrowserd is not running"
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+case "$1" in
+  start)   start ;;
+  stop)    stop ;;
+  restart) stop; start ;;
+  status)  status ;;
+  *)
+    echo "Usage: $(basename "$0") start|stop|restart|status"
+    exit 1
+    ;;
+esac
+exit $?

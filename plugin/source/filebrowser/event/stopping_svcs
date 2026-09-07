@@ -1,0 +1,17 @@
+#!/bin/bash
+#
+# emhttp event: stopping_svcs
+#
+# Fired when the array is being stopped, before the disks are unmounted. The
+# daemon holds the SQLite index open under the data directory, so it has to let
+# go here or the unmount fails.
+#
+# Unconditional: the daemon is stopped regardless of the autostart setting.
+
+PLUGIN="filebrowser"
+PLUGDIR="/usr/local/emhttp/plugins/${PLUGIN}"
+
+[ -x "${PLUGDIR}/rc.filebrowserd" ] || exit 0
+
+"${PLUGDIR}/rc.filebrowserd" stop 2>&1 | logger -t "${PLUGIN}"
+exit 0

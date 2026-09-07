@@ -1,0 +1,20 @@
+dist/
+build/
+node_modules/
+web/dist/
+daemon/filebrowserd
+daemon/filebrowserd-*
+*.txz
+*.db
+.DS_Store
+coverage.out
+.playwright-mcp/
+*.swp
+*~
+.idea/
+.vscode/
+.leakcheck.local
+# Claude Code / AI-assistant artifacts — never part of the project
+.claude/
+CLAUDE.md
+CLAUDE.local.md

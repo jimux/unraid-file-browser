@@ -1,0 +1,177 @@
+Menu="Utilities"
+Title="File Browser Settings"
+Icon="folder-open-o"
+Tag="folder-open-o"
+---
+<?PHP
+/* FileBrowserSettings.page - service control and daemon settings
+ *
+ * Copyright 2026, James Smyth
+ *
+ * Licensed under the MIT License; see the LICENSE file in the project root.
+ *
+ * NOTE ON THE FILE NAME: the webGUI keys its page registry on the .page
+ * basename ($site[basename] in PageBuilder.php), so a file called
+ * Settings.page here would silently replace dynamix's own Settings.page and
+ * break the Settings menu. The page still lands under Settings > User
+ * Utilities via Menu="Utilities" - see plugin/README.md.
+ */
+require_once '/usr/local/emhttp/plugins/filebrowser/include/settings.php';
+
+$fb_cfg     = fb_settings();
+$fb_pid     = fb_pid();
+$fb_socket  = fb_socket_present();
+$fb_running = ($fb_pid > 0);
+$fb_csrf    = _var($var, 'csrf_token');
+$fb_started = (_var($var, 'fsState') == 'Started');
+?>
+<script>
+/* json_encode (not a bare interpolation) so nothing from the server can break
+   out of this string literal into script context. */
+var fbCsrf = <?=json_encode((string)$fb_csrf, JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT)?>;
+
+// Poll the daemon through the same authenticated bridge the SPA uses, so this
+// page reports exactly what the app would see.
+function fbHealth() {
+  var url = '/plugins/filebrowser/proxy.php?p=' + encodeURIComponent('/api/v1/healthz');
+  $.ajax({url:url, dataType:'json', cache:false})
+   .done(function(data){
+      if (data && data.ok && data.data) {
+        $('#fb-state').html("<span class='green-text'><i class='fa fa-circle'></i> _(Running)_</span>");
+        $('#fb-version').text(data.data.version || '-');
+        $('#fb-uptime').text(fbUptime(data.data.uptimeSec));
+        $('#fb-index').text(data.data.indexDb || '-');
+      } else {
+        fbDown(data);
+      }
+   })
+   .fail(function(xhr){
+      var data = null;
+      try { data = JSON.parse(xhr.responseText); } catch(e) {}
+      fbDown(data);
+   });
+}
+
+function fbDown(data) {
+  var msg = (data && data.error && data.error.message) ? data.error.message : "_(not responding)_";
+  // The message comes from the daemon (or from proxy.php's error envelope), so
+  // it is untrusted markup: build the static part with .html() and insert the
+  // message itself with .text().
+  $('#fb-state').html("<span class='red-text'><i class='fa fa-circle'></i> _(Stopped)_ (<span id='fb-msg'></span>)</span>");
+  $('#fb-msg').text(msg);
+  $('#fb-version').text('-');
+  $('#fb-uptime').text('-');
+  $('#fb-index').text('-');
+}
+
+function fbUptime(sec) {
+  sec = parseInt(sec, 10);
+  if (!sec || sec < 0) return '-';
+  var d = Math.floor(sec/86400), h = Math.floor((sec%86400)/3600),
+      m = Math.floor((sec%3600)/60), s = sec%60;
+  if (d) return d+'d '+h+'h';
+  if (h) return h+'h '+m+'m';
+  if (m) return m+'m '+s+'s';
+  return s+'s';
+}
+
+function fbAction(action) {
+  $('#fb-buttons button').prop('disabled', true);
+  $('#fb-output').show().text("_(Working)_ ...");
+  $.post('/plugins/filebrowser/include/exec.php', {action:action, csrf_token:fbCsrf}, function(data){
+      $('#fb-buttons button').prop('disabled', false);
+      var out = (data && data.data && data.data.output) ? data.data.output : '';
+      if (!out && data && data.error) out = data.error.message;
+      $('#fb-output').text(out || '_(Done)_');
+      $('#fb-pid').text((data && data.data && data.data.pid) ? data.data.pid : '-');
+      fbHealth();
+   }, 'json')
+   .fail(function(){
+      $('#fb-buttons button').prop('disabled', false);
+      $('#fb-output').text("_(Command failed)_ - _(see)_ /var/log/filebrowserd.log");
+   });
+}
+
+$(function(){
+  fbHealth();
+  setInterval(fbHealth, 10000);
+});
+</script>
+<style>
+#fb-output { display:none; white-space:pre-wrap; font-family:bitstream,monospace; font-size:1.1rem; margin-top:10px; }
+#fb-buttons button { margin-right:8px; }
+table.fb-status td:first-child { width:22rem; }
+</style>
+
+<table class="tablesorter fb-status">
+<thead><tr><th colspan="2"><i class="fa fa-folder-open-o"></i>_(File Browser service)_</th></tr></thead>
+<tbody>
+<tr><td>_(Status)_</td><td id="fb-state">_(checking)_ ...</td></tr>
+<tr><td>_(Daemon version)_</td><td id="fb-version">-</td></tr>
+<tr><td>_(Uptime)_</td><td id="fb-uptime">-</td></tr>
+<tr><td>_(Index database)_</td><td id="fb-index">-</td></tr>
+<tr><td>_(Process id)_</td><td id="fb-pid"><?=$fb_running ? $fb_pid : '-'?></td></tr>
+<tr><td>_(Socket)_</td><td><?=htmlspecialchars(FB_SOCKET)?> &mdash; <?=$fb_socket ? _('present') : _('absent')?></td></tr>
+<tr><td>_(Log)_</td><td><?=htmlspecialchars(FB_LOGFILE)?></td></tr>
+</tbody>
+</table>
+
+<div id="fb-buttons">
+<button type="button" onclick="fbAction('start')"><i class="fa fa-play"></i> _(Start)_</button>
+<button type="button" onclick="fbAction('stop')"><i class="fa fa-stop"></i> _(Stop)_</button>
+<button type="button" onclick="fbAction('restart')"><i class="fa fa-refresh"></i> _(Restart)_</button>
+</div>
+<div id="fb-output"></div>
+
+<?PHP if (!$fb_started): ?>
+<div class="notice">_(The array is not started. File Browser keeps its index on the array, so the daemon runs degraded until the array is up.)_</div>
+<?PHP endif; ?>
+
+<?PHP if (!empty($fb_cfg['INVALID'])): ?>
+<div class="notice"><?=_('These settings hold values the plugin will not use and has replaced with the defaults shown below')?>:
+<strong><?=htmlspecialchars(implode(', ', $fb_cfg['INVALID']))?></strong>.
+<?=_('Re-enter them and press Apply.')?></div>
+<?PHP endif; ?>
+
+---
+
+<form markdown="1" name="filebrowser_settings" method="POST" action="/update.php" target="progressFrame">
+<input type="hidden" name="#file" value="filebrowser/settings.cfg">
+<?PHP if ($fb_running): ?>
+<input type="hidden" name="#command" value="/plugins/filebrowser/rc.filebrowserd">
+<input type="hidden" name="#arg[1]" value="restart">
+<?PHP endif; ?>
+
+_(Start File Browser with the array)_:
+: <select name="SERVICE">
+  <?=mk_option($fb_cfg['SERVICE'], "disable", _("No"))?>
+  <?=mk_option($fb_cfg['SERVICE'], "enable", _("Yes"))?>
+  </select>
+
+> _(When enabled, the daemon is started from the array-start event and after a plugin update. When disabled, start it by hand with the buttons above.)_
+
+_(Data directory)_:
+: <input type="text" name="DATA_DIR" maxlength="200" pattern="/[A-Za-z0-9._@/ -]+" value="<?=htmlspecialchars($fb_cfg['DATA_DIR'])?>">
+
+> _(Where the search index database and archive scratch files are kept. Must be an absolute path on the array or a pool - never on the flash drive, which would be worn out by index writes. Default)_: /mnt/user/appdata/filebrowser
+
+_(Browse roots)_:
+: <input type="text" name="BROWSE_ROOTS" maxlength="400" pattern="/[A-Za-z0-9._@/ -]*(,/[A-Za-z0-9._@/ -]*)*" value="<?=htmlspecialchars($fb_cfg['BROWSE_ROOTS'])?>">
+
+> _(Comma-separated absolute paths the file browser and search may access. Nothing outside these paths can be listed, read or indexed. This is deliberately not editable from inside the app - it is the confinement boundary for a daemon that runs as root. Changes take effect when the service restarts. Default)_: /mnt/user
+
+&nbsp;
+: <input type="submit" name="#default" value="_(Default)_"><input type="submit" value="_(Apply)_"><input type="button" value="_(Done)_" onclick="done()">
+
+</form>
+
+<?PHP if ($fb_running): ?>
+> _(Applying these settings restarts the daemon.)_
+<?PHP else: ?>
+> _(The daemon is not running; these settings take effect the next time it starts.)_
+<?PHP endif; ?>
+
+### _(Index configuration)_
+
+_(Index roots, the crawl schedule, content-indexing rules and the file-size cap live in the daemon's own configuration and are edited inside the app: open)_
+**[_(Tools)_ &rarr; _(File Browser)_](/Tools/FileBrowser)** _(and use its Settings panel. They are stored in the data directory above, not on the flash drive.)_

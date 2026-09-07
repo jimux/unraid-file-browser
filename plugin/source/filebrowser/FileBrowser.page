@@ -1,0 +1,118 @@
+Menu="Tools"
+Title="File Browser"
+Icon="folder-open-o"
+Tag="folder-open-o"
+Markdown="false"
+---
+<?PHP
+/* FileBrowser.page - hosts the File Browser SPA inside the webGUI
+ *
+ * Copyright 2026, James Smyth
+ *
+ * Licensed under the MIT License; see the LICENSE file in the project root.
+ */
+require_once '/usr/local/emhttp/plugins/filebrowser/include/settings.php';
+
+$fb_cfg     = fb_settings();
+$fb_theme   = fb_theme($display);
+$fb_running = fb_socket_present();
+$fb_csrf    = _var($var, 'csrf_token');
+$fb_started = (_var($var, 'fsState') == 'Started');
+$fb_app     = '/plugins/filebrowser/app/index.html';
+
+// The SPA is a static bundle served by emhttp's nginx, so it cannot read the
+// webGUI's csrf_token itself. Hand it over on the iframe URL (same origin) so
+// its POSTs through proxy.php can set the X-CSRF-TOKEN header. See
+// plugin/README.md - "SPA contract".
+$fb_src = $fb_app
+        . '?theme=' . rawurlencode($fb_theme)
+        . '&csrf='  . rawurlencode((string)$fb_csrf);
+?>
+<style>
+#fb-wrap        { margin:0; padding:0; }
+#fb-frame       { width:100%; min-height:480px; border:0; display:block; background:transparent; }
+#fb-offline     { margin:12px 0 18px 0; padding:14px 16px; border-left:4px solid #e0711a; background:rgba(128,128,128,.10); }
+#fb-offline h3  { margin:0 0 6px 0; font-size:1.2rem; }
+#fb-offline p   { margin:4px 0; }
+#fb-offline .fb-actions { margin-top:12px; }
+#fb-out         { margin-top:10px; white-space:pre-wrap; font-family:bitstream,monospace; font-size:1.1rem; display:none; }
+</style>
+
+<?PHP if (!$fb_running): ?>
+<div id="fb-offline">
+  <h3><i class="fa fa-warning"></i> <?=_('The File Browser daemon is not running')?></h3>
+  <p><?=_('The web interface cannot load until filebrowserd is started.')?></p>
+<?PHP if (!$fb_started): ?>
+  <p><?=_('The array is not started. File Browser indexes data on the array, so start the array first.')?></p>
+<?PHP endif; ?>
+  <p><?=_('Autostart')?>:
+     <strong><?=$fb_cfg['SERVICE'] == 'enable' ? _('Enabled') : _('Disabled')?></strong>
+     &nbsp;&middot;&nbsp;
+     <?=_('Data directory')?>: <strong><?=htmlspecialchars($fb_cfg['DATA_DIR'])?></strong>
+  </p>
+  <div class="fb-actions">
+    <button type="button" id="fb-start"><i class="fa fa-play"></i> <?=_('Start')?></button>
+    <a href="/Settings/FileBrowserSettings" class="fb-settings-link"><?=_('File Browser Settings')?></a>
+  </div>
+  <div id="fb-out"></div>
+</div>
+<?PHP else: ?>
+<div id="fb-wrap">
+  <iframe id="fb-frame" src="<?=htmlspecialchars($fb_src)?>" title="<?=htmlspecialchars(_('File Browser'))?>"
+          allow="clipboard-write" referrerpolicy="same-origin"></iframe>
+</div>
+<?PHP endif; ?>
+
+<script>
+(function(){
+  /* json_encode (not a bare interpolation) so nothing coming from the server
+     can break out of this string literal into script context. */
+  var csrf = <?=json_encode((string)$fb_csrf, JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT)?>;
+
+  // ---- full-height iframe -------------------------------------------------
+  // The four webGUI themes put the content area at different offsets (top-nav
+  // vs sidebar), so measure rather than guess.
+  var frame = document.getElementById('fb-frame');
+  function fit() {
+    if (!frame) return;
+    var top = frame.getBoundingClientRect().top;
+    var h   = window.innerHeight - top - 24;
+    if (h < 480) h = 480;
+    frame.style.height = h + 'px';
+  }
+  if (frame) {
+    fit();
+    window.addEventListener('resize', fit);
+    // Theme/font switches and the sidebar toggle reflow the page after load.
+    window.setTimeout(fit, 250);
+    window.setTimeout(fit, 1000);
+  }
+
+  // ---- start button (offline banner) -------------------------------------
+  var btn = document.getElementById('fb-start');
+  var out = document.getElementById('fb-out');
+  if (btn) {
+    btn.addEventListener('click', function(){
+      btn.disabled = true;
+      out.style.display = 'block';
+      out.textContent = <?=json_encode(_('Starting filebrowserd ...'), JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT)?>;
+      $.post('/plugins/filebrowser/include/exec.php',
+             {action:'start', csrf_token:csrf},
+             function(data){
+               if (data && data.ok && data.data && data.data.socket) {
+                 location.reload();
+                 return;
+               }
+               btn.disabled = false;
+               var msg = (data && data.data && data.data.output) ? data.data.output
+                       : ((data && data.error && data.error.message) ? data.error.message : <?=json_encode(_('Start failed'), JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT)?>);
+               out.textContent = msg;
+             }, 'json')
+       .fail(function(){
+               btn.disabled = false;
+               out.textContent = <?=json_encode(_('Start failed - see /var/log/filebrowserd.log'), JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT)?>;
+             });
+    });
+  }
+})();
+</script>

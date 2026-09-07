@@ -1,0 +1,9 @@
+* text=auto
+*.plg text eol=lf
+*.sh text eol=lf
+*.php text eol=lf
+*.page text eol=lf
+rc.* text eol=lf
+plugin/source/filebrowser/event/* text eol=lf
+Makefile text eol=lf
+*.png binary
