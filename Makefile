@@ -85,6 +85,8 @@ package: daemon-linux web
 
 	@# Web SPA static assets
 	cp -R web/dist/. "$(WORK)/usr/local/emhttp/plugins/filebrowser/app/"
+	@# Read by FileBrowser.page to cache-bust the iframe URL on every update.
+	printf '%s\n' "$(VERSION)" > "$(WORK)/usr/local/emhttp/plugins/filebrowser/VERSION"
 
 	@# Daemon binary
 	cp daemon/filebrowserd-linux-amd64 "$(WORK)/usr/local/sbin/filebrowserd"

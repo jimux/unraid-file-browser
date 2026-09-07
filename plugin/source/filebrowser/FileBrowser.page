@@ -25,9 +25,18 @@ $fb_app     = '/plugins/filebrowser/app/index.html';
 // webGUI's csrf_token itself. Hand it over on the iframe URL (same origin) so
 // its POSTs through proxy.php can set the X-CSRF-TOKEN header. See
 // plugin/README.md - "SPA contract".
+// Installed plugin version, written into the package by the Makefile. Appended
+// to the iframe URL purely as a cache-buster: the SPA's index.html lives at a
+// fixed URL, and without this a browser keeps serving its cached copy (and the
+// old hashed bundle it references) after a plugin update.
+$fb_ver = @file_get_contents('/usr/local/emhttp/plugins/filebrowser/VERSION');
+$fb_ver = preg_replace('/[^A-Za-z0-9.]/', '', (string)$fb_ver);
+if ($fb_ver === '') $fb_ver = (string)@filemtime('/usr/local/emhttp/plugins/filebrowser/app/index.html');
+
 $fb_src = $fb_app
         . '?theme=' . rawurlencode($fb_theme)
-        . '&csrf='  . rawurlencode((string)$fb_csrf);
+        . '&csrf='  . rawurlencode((string)$fb_csrf)
+        . '&v='     . rawurlencode($fb_ver);
 ?>
 <style>
 #fb-wrap        { margin:0; padding:0; }

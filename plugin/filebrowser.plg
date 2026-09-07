@@ -26,6 +26,9 @@
 <CHANGES>
 ##File Browser
 
+###2026.09.07c
+- Fix: the web app could stay stale in the browser after a plugin update (cached index.html); the page now cache-busts on the installed version
+
 ###2026.09.07b
 - Video and audio playback in a separate player window (streamed, seekable)
 - Arrow keys step to previous/next media file in the directory's sort order; auto-advance
