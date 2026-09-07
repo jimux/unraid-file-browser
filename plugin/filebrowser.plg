@@ -26,6 +26,11 @@
 <CHANGES>
 ##File Browser
 
+###2026.09.07b
+- Video and audio playback in a separate player window (streamed, seekable)
+- Arrow keys step to previous/next media file in the directory's sort order; auto-advance
+- Bridge: large downloads/streams no longer buffered by nginx; a slow disk or archive extraction mid-stream no longer truncates the file
+
 ###2026.09.07a
 - File Browser is now its own top-level tab instead of an entry under Tools
 

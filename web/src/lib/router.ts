@@ -3,6 +3,8 @@
  *
  *   #/browse/<encodeURIComponent(path)>
  *   #/view/<encodeURIComponent(path)>     (viewer panel over the parent dir)
+ *   #/play/<encodeURIComponent(path)>?sort=<key>&dir=<asc|desc>
+ *                                         (standalone media player, own window)
  *   #/search?q=…&mode=…&…
  *   #/settings
  *
@@ -10,9 +12,28 @@
  * collide with the route grammar.
  */
 
+import type { SortDir, SortKey } from "../api/types";
+
+/**
+ * The player's prev/next keys walk the file's siblings *in the order the
+ * browser view is currently sorted in*, so the player window — a separate
+ * document with no access to the browser's React state — has to be told that
+ * order. It rides in the hash as `?sort=&dir=`; a link that omits them (the
+ * viewer panel, search results) gets the daemon's own defaults.
+ */
+export interface PlaySort {
+  sort: SortKey;
+  dir: SortDir;
+}
+
+export const DEFAULT_PLAY_SORT: PlaySort = { sort: "name", dir: "asc" };
+
+const SORT_KEYS: readonly string[] = ["name", "size", "mtime", "type"];
+
 export type Route =
   | { name: "browse"; path: string }
   | { name: "view"; path: string }
+  | ({ name: "play"; path: string } & PlaySort)
   | { name: "search"; query: URLSearchParams }
   | { name: "settings" }
   | { name: "unknown" };
@@ -23,6 +44,19 @@ export function browseHref(path: string): string {
 
 export function viewHref(path: string): string {
   return `#/view/${encodeURIComponent(path)}`;
+}
+
+/**
+ * `sort` is optional: omitting it keeps the URL short and lets the player fall
+ * back to name/asc, which is what a caller that has no sort of its own wants.
+ */
+export function playHref(path: string, sort?: Partial<PlaySort> | null): string {
+  const base = `#/play/${encodeURIComponent(path)}`;
+  if (!sort || (!sort.sort && !sort.dir)) return base;
+  const sp = new URLSearchParams();
+  sp.set("sort", sort.sort ?? DEFAULT_PLAY_SORT.sort);
+  sp.set("dir", sort.dir ?? DEFAULT_PLAY_SORT.dir);
+  return `${base}?${sp.toString()}`;
 }
 
 export function searchHref(params: URLSearchParams | string): string {
@@ -68,6 +102,11 @@ export function parseRoute(hash: string): Route {
       const p = clampPathDepth(decodeSafe(segs.slice(1).join("/")));
       return p ? { name: "view", path: p } : { name: "unknown" };
     }
+    case "play": {
+      const p = clampPathDepth(decodeSafe(segs.slice(1).join("/")));
+      if (!p) return { name: "unknown" };
+      return { name: "play", path: p, ...parsePlaySort(new URLSearchParams(queryPart)) };
+    }
     case "search":
       return { name: "search", query: new URLSearchParams(queryPart) };
     case "settings":
@@ -75,6 +114,20 @@ export function parseRoute(hash: string): Route {
     default:
       return { name: "unknown" };
   }
+}
+
+/**
+ * Anything unrecognised collapses to the defaults rather than being forwarded:
+ * these values go straight into an `fs/list` query, and the daemon answers
+ * BAD_REQUEST for a bogus `sort`, which would disable navigation for no reason.
+ */
+export function parsePlaySort(q: URLSearchParams): PlaySort {
+  const sort = q.get("sort");
+  const dir = q.get("dir");
+  return {
+    sort: sort && SORT_KEYS.includes(sort) ? (sort as SortKey) : DEFAULT_PLAY_SORT.sort,
+    dir: dir === "desc" ? "desc" : "asc",
+  };
 }
 
 function decodeSafe(s: string): string {

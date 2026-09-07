@@ -83,7 +83,7 @@ export function SearchView({
   params: URLSearchParams;
   currentDir: string;
   onNavigate: (p: string) => void;
-  onOpenFile: (p: string) => void;
+  onOpenFile: (p: string, mime?: string) => void;
 }) {
   const [form, setForm] = useState<FormState>(() => initialForm(params, currentDir));
   const [result, setResult] = useState<SearchResult | null>(null);
@@ -330,7 +330,7 @@ export function SearchView({
                   type="button"
                   className="hit-name"
                   title={e.path}
-                  onClick={() => (e.type === "dir" || e.type === "archive" ? onNavigate(e.path) : onOpenFile(e.path))}
+                  onClick={() => (e.type === "dir" || e.type === "archive" ? onNavigate(e.path) : onOpenFile(e.path, e.mime))}
                 >
                   {e.name}
                 </button>

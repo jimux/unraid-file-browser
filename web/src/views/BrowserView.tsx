@@ -5,6 +5,7 @@ import { useDirListing } from "../hooks/useDirListing";
 import { EmptyState, ErrorBanner, SkeletonRows, Spinner } from "../components/Feedback";
 import { EntryIcon } from "../components/Icon";
 import { formatAbsolute, formatBytesExact, formatRelative, formatSize, typeLabel } from "../lib/format";
+import { isMedia } from "../lib/media";
 import { parentPath } from "../lib/paths";
 
 const ROW_HEIGHT = 26;
@@ -22,7 +23,10 @@ interface BrowserViewProps {
   sort: SortState;
   onSortChange: (s: SortState) => void;
   onNavigate: (p: string) => void;
+  /** Default action for a file: viewer panel, or the player window for media. */
   onOpenFile: (e: Entry) => void;
+  /** Secondary action (Shift+Enter / "Details"): always the viewer panel. */
+  onOpenDetails: (e: Entry) => void;
   reloadNonce: number;
   /** Dimmed while the viewer panel is on top. */
   inert?: boolean;
@@ -41,6 +45,7 @@ export function BrowserView({
   onSortChange,
   onNavigate,
   onOpenFile,
+  onOpenDetails,
   reloadNonce,
   inert,
 }: BrowserViewProps) {
@@ -143,7 +148,10 @@ export function BrowserView({
         case "Enter": {
           ev.preventDefault();
           const e = entries[selected];
-          if (e) activate(e);
+          if (!e) break;
+          // Shift+Enter always means "inspect", never "play".
+          if (ev.shiftKey && e.type !== "dir" && e.type !== "archive") onOpenDetails(e);
+          else activate(e);
           break;
         }
         case "ArrowRight": {
@@ -167,7 +175,7 @@ export function BrowserView({
           break;
       }
     },
-    [activate, entries, inert, move, onNavigate, path, selected],
+    [activate, entries, inert, move, onNavigate, onOpenDetails, path, selected],
   );
 
   const toggleSort = (key: SortKey) => {
@@ -222,10 +230,11 @@ export function BrowserView({
               const e = entries[vi.index];
               if (!e) return null;
               const isSel = vi.index === selected;
+              const media = e.type === "file" && isMedia(e.mime);
               return (
                 <div
                   key={`${e.path}-${vi.index}`}
-                  className={`tr${vi.index % 2 ? " is-odd" : ""}${isSel ? " is-selected" : ""} tr-${e.type}`}
+                  className={`tr${vi.index % 2 ? " is-odd" : ""}${isSel ? " is-selected" : ""} tr-${e.type}${media ? " is-media" : ""}`}
                   role="row"
                   aria-rowindex={vi.index + 1}
                   style={{ transform: `translateY(${vi.start}px)`, height: `${ROW_HEIGHT}px` }}
@@ -247,6 +256,21 @@ export function BrowserView({
                     >
                       {e.name}
                     </button>
+                    {media ? (
+                      <button
+                        type="button"
+                        className="row-action"
+                        title="Open the viewer panel instead of the player (Shift+Enter)"
+                        onClick={(ev) => {
+                          ev.stopPropagation();
+                          setSelected(vi.index);
+                          onOpenDetails(e);
+                        }}
+                        tabIndex={-1}
+                      >
+                        Details
+                      </button>
+                    ) : null}
                     {e.type === "symlink" && e.target ? <span className="symlink-target">→ {e.target}</span> : null}
                   </div>
                   <div className="td col-size" title={formatBytesExact(e.size)}>
@@ -272,7 +296,7 @@ export function BrowserView({
           {total > entries.length ? ` of ${total.toLocaleString()}` : ""} item{total === 1 ? "" : "s"}
         </span>
         {loadingMore ? <Spinner label="loading more…" /> : null}
-        <span className="foot-hint">↑↓ move · Enter open · Backspace up</span>
+        <span className="foot-hint">↑↓ move · Enter open · ⇧Enter details · Backspace up</span>
       </footer>
     </section>
   );

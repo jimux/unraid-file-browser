@@ -19,8 +19,12 @@ existing data is ever modified by the plugin.
   and other formats supported by the bundled 7zz binary.  Archives may be nested
   up to three levels deep, and each layer is addressed with the same path API as
   a real directory.
-- **Image preview** for common raster and vector formats; download always
-  available.
+- **Image preview** for common raster formats; download always available.
+- **Play video and audio** in a separate player window, streamed straight from
+  the array with seeking. Arrow keys step to the previous/next media file in
+  the directory's current sort order, with optional auto-advance. Playback is
+  native to the browser (no transcoding): MP4/H.264, WebM, most MOV and MKV
+  with H.264, and common audio formats play; others get a download prompt.
 
 ## Architecture
 
@@ -51,6 +55,7 @@ and nothing is exposed on the local network.
 |---|---|
 | Directory listing | Sorted by name, size, mtime, or type; ascending or descending; directories-first option; paged (up to 10 000 entries per request) |
 | File viewer | Text with encoding selection; windowed (256 KB per page) so 40 GB logs are fine; hex view; image preview |
+| Media player | Separate window; HTTP Range streaming (seekable); ↑/↓ previous/next in the directory's sort order; auto-advance; native browser codecs only |
 | Encoding support | UTF-8/16/32, ISO-8859-1 through -16, Windows-125x, Shift-JIS, EUC-JP, EUC-KR, GBK, GB18030, Big5, KOI8-R/U, Mac-Roman, and more |
 | Archive browsing | zip, tar.gz, tar.bz2, tar.xz, tar.zst, 7z, iso, rar, cab; nested archives up to depth 3 |
 | Search — filename | FTS5 prefix match on name, extension, directory; filters: type, size range, mtime range |

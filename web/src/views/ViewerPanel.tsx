@@ -5,7 +5,8 @@ import { ErrorBanner, SkeletonBlock, Spinner } from "../components/Feedback";
 import { Icon } from "../components/Icon";
 import { useAsync } from "../hooks/useAsync";
 import { formatBytesExact, formatOffsetHex, formatSize } from "../lib/format";
-import { basename } from "../lib/paths";
+import { isMedia, mediaKind, openPlayer, playability, playerUrl } from "../lib/media";
+import { basename, isVirtual } from "../lib/paths";
 
 const TEXT_WINDOW = 262144; // API.md default; max 1048576
 const HEX_WINDOW = 4096; // API.md default; max 65536
@@ -31,20 +32,23 @@ function isInlineImage(mime: string | undefined): boolean {
   return INLINE_IMAGE_MIMES.has(mime.split(";")[0].trim().toLowerCase());
 }
 
-type Tab = "text" | "hex" | "image" | "download";
+type Tab = "text" | "hex" | "image" | "media" | "download";
 
 export function ViewerPanel({ path, onClose }: { path: string; onClose: () => void }) {
   const entryState = useAsync<Entry>((signal) => stat(path, signal).then((r) => r.entry), [path]);
   const entry = entryState.data;
   const isImage = isInlineImage(entry?.mime);
+  const isPlayable = isMedia(entry?.mime);
 
   const [tab, setTab] = useState<Tab>("text");
   const [tabPinned, setTabPinned] = useState(false);
 
-  // Default to the image tab for images, unless the user already chose a tab.
+  // Default to the richest tab the file supports, unless the user chose one.
   useEffect(() => {
-    if (!tabPinned && isImage) setTab("image");
-  }, [isImage, tabPinned]);
+    if (tabPinned) return;
+    if (isImage) setTab("image");
+    else if (isPlayable) setTab("media");
+  }, [isImage, isPlayable, tabPinned]);
 
   useEffect(() => {
     setTabPinned(false);
@@ -77,8 +81,8 @@ export function ViewerPanel({ path, onClose }: { path: string; onClose: () => vo
           ) : null}
         </div>
         <nav className="viewer-tabs" role="tablist">
-          {(["text", "hex", "image", "download"] as Tab[]).map((t) => {
-            const disabled = t === "image" && !isImage;
+          {(["text", "hex", "image", "media", "download"] as Tab[]).map((t) => {
+            const disabled = (t === "image" && !isImage) || (t === "media" && !isPlayable);
             return (
               <button
                 key={t}
@@ -87,7 +91,13 @@ export function ViewerPanel({ path, onClose }: { path: string; onClose: () => vo
                 aria-selected={tab === t}
                 className={`btn btn-tab${tab === t ? " is-active" : ""}`}
                 disabled={disabled}
-                title={disabled ? "Not an inline-previewable image (png, jpeg, gif, webp, bmp, avif)" : undefined}
+                title={
+                  disabled
+                    ? t === "media"
+                      ? "Not an audio or video file"
+                      : "Not an inline-previewable image (png, jpeg, gif, webp, bmp, avif)"
+                    : undefined
+                }
                 onClick={() => pick(t)}
               >
                 {t[0].toUpperCase() + t.slice(1)}
@@ -106,6 +116,7 @@ export function ViewerPanel({ path, onClose }: { path: string; onClose: () => vo
         {tab === "text" ? <TextTab path={path} /> : null}
         {tab === "hex" ? <HexTab path={path} /> : null}
         {tab === "image" ? <ImageTab path={path} /> : null}
+        {tab === "media" ? <MediaTab path={path} mime={entry?.mime ?? ""} /> : null}
         {tab === "download" ? <DownloadTab path={path} entry={entry} /> : null}
       </div>
     </section>
@@ -274,6 +285,72 @@ function ImageTab({ path }: { path: string }) {
       ) : (
         <div className="image-wrap">
           <img src={rawUrl(path)} alt={basename(path)} onError={() => setFailed(true)} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------- media */
+
+/**
+ * Audio/video files are *played* in their own window (`#/play/…`), not inside
+ * this panel — a 40 GB movie has no business sharing a 300px pane with a hex
+ * dump. This tab is the launcher, plus a small in-panel preview so the user can
+ * confirm the file is what they think before opening a window for it.
+ */
+function MediaTab({ path, mime }: { path: string; mime: string }) {
+  const kind = mediaKind(mime) ?? "video";
+  const verdict = useMemo(() => playability(kind, mime), [kind, mime]);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => setFailed(false), [path]);
+
+  const unsupported = verdict === "no" || failed;
+
+  return (
+    <div className="tab-pane tab-media">
+      <div className="media-launch">
+        <button
+          type="button"
+          className="btn btn-primary btn-play"
+          onClick={() => openPlayer(path)}
+          title="Opens a separate window streaming from fs/raw"
+        >
+          <span className="play-glyph" aria-hidden="true">
+            ▶
+          </span>
+          Play in new window
+        </button>
+        <a className="btn" href={rawUrl(path, true)} download={basename(path)}>
+          Download
+        </a>
+      </div>
+
+      <div className="muted small media-note">
+        {unsupported ? (
+          <>
+            Your browser can’t play <code className="mono">{mime || "this type"}</code> natively — download the file or
+            use an external player. There is no server-side transcoding.
+          </>
+        ) : isVirtual(path) ? (
+          <>Streams from inside the archive: playback works, but seeking does not (no Range support on virtual paths).</>
+        ) : (
+          <>Streams with HTTP Range, so seeking works without downloading the whole file.</>
+        )}
+        <div className="media-url mono" title={playerUrl(path)}>
+          {playerUrl(path)}
+        </div>
+      </div>
+
+      {unsupported ? null : (
+        <div className="media-preview">
+          {kind === "video" ? (
+            // eslint-disable-next-line jsx-a11y/media-has-caption
+            <video src={rawUrl(path)} controls preload="metadata" playsInline onError={() => setFailed(true)} />
+          ) : (
+            // eslint-disable-next-line jsx-a11y/media-has-caption
+            <audio src={rawUrl(path)} controls preload="metadata" onError={() => setFailed(true)} />
+          )}
         </div>
       )}
     </div>

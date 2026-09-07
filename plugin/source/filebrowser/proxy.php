@@ -49,6 +49,11 @@
  *     the daemon sent (see "raw hardening" below): the webGUI origin is the
  *     root-authenticated origin, so a file served inline with an attacker
  *     chosen Content-Type would be stored XSS with root privileges.
+ *   - fs/raw is relayed as a *stream*: no execution-time limit, no output
+ *     buffer, no nginx buffering, and a daemon that goes quiet is waited on
+ *     rather than treated as end-of-body (see "streaming preamble" below).
+ *     A vanished client still ends it immediately - ignore_user_abort is left
+ *     false, unlike the SSE branch.
  *   - NOTHING in this file shells out. No exec/system/popen/proc_open, no
  *     backticks. Path strings from the browser are only ever written into an
  *     HTTP request line on a unix socket.
@@ -74,6 +79,22 @@ $FB_VAR_INI      = '/var/local/emhttp/var.ini';
 $FB_CONNECT_WAIT = 5;      // seconds to wait for connect()
 $FB_TIMEOUT      = 60;     // seconds of read inactivity for normal requests
 $FB_CHUNK        = 65536;  // body relay buffer
+
+// fs/raw is a stream, not a request: a 40 GB download or a video scrubbed by a
+// player under backpressure legitimately lives for hours, and API.md gives it
+// no daemon-side deadline. So the relay never counts wall clock against it -
+// what it counts is *silence from the daemon*. $FB_TIMEOUT is only the
+// granularity of that wait (one fread() blocks that long); the stream is given
+// up only after $FB_RAW_STALL seconds with no body byte at all, which covers a
+// spun-down disk or a slow 7zz extraction without pinning an fpm worker on a
+// wedged daemon forever.
+$FB_RAW_STALL    = 300;    // seconds of daemon silence that ends an fs/raw body
+// An fs/raw body at or above this size (or of unknown size) is streamed with
+// nginx buffering switched off - see "streaming preamble" below. Smaller bodies
+// (thumbnails, a player's opening probe range, a small PDF) keep the default
+// buffering: nginx takes the whole thing at once and the php-fpm worker is free
+// again immediately, which matters because a pool has only a handful of them.
+$FB_RAW_NOBUFFER = 8388608;
 
 // SSE budgets. A php-fpm worker is pinned for the whole life of an event
 // stream, so an abandoned tab must never hold one: we poll the socket, ping
@@ -356,7 +377,8 @@ foreach ($relay as $key => $name) {
 // a daemon of different vintages must never combine into "arbitrary file body
 // rendered as a document on the root-authenticated webGUI origin". These
 // header() calls replace whatever was relayed above.
-if ($pathOnly === '/api/v1/fs/raw') {
+$isRaw = ($pathOnly === '/api/v1/fs/raw');
+if ($isRaw) {
   header('X-Content-Type-Options: nosniff');
   header("Content-Security-Policy: default-src 'none'; sandbox");
 
@@ -377,6 +399,46 @@ if ($pathOnly === '/api/v1/fs/raw') {
 // decoded here and emitted plain, so the upstream length would be wrong.
 if ($hasLen && !$isSse) {
   header('Content-Length: ' . $bodyLen);
+}
+
+// ---------------------------------------------------------------------------
+// streaming preamble for fs/raw
+// ---------------------------------------------------------------------------
+// A media player reads a video at whatever rate it needs, so an fs/raw response
+// spends most of its life blocked in a write to a client that is not asking for
+// more yet. Everything that would put a clock or a buffer between that client
+// and this loop has to go, exactly like the SSE branch below does it:
+//
+//   - set_time_limit(0): the relay is a stream. max_execution_time is finite in
+//     php.ini, and on a PHP built with zend_max_execution_timers it counts wall
+//     clock - including time blocked writing to a slow player - so a paused or
+//     throttled video would die on the timer with a truncated body.
+//   - zlib.output_compression off: we relay the daemon's Content-Length (and
+//     Content-Range) verbatim, so nothing may re-encode the body underneath it.
+//   - no userland output buffer: slabs go straight to the SAPI, which keeps
+//     memory flat on a multi-GB download and makes the client's backpressure -
+//     and its disappearance - visible to this loop.
+//   - X-Accel-Buffering: no (big/unknown bodies only): without it nginx happily
+//     buffers the response into its temp dir (RAM on Unraid) and answers the
+//     player itself, which both defeats the backpressure above and can spool
+//     gigabytes nobody asked for. Below $FB_RAW_NOBUFFER we leave buffering on
+//     so a thumbnail does not hold an fpm worker for the client's whole read.
+//   - ignore_user_abort stays FALSE (unlike SSE, which owns its own lifetime):
+//     when the player closes the tab or seeks elsewhere, this request must end
+//     promptly so the daemon stops reading the file. $emit's connection_aborted()
+//     check is the graceful path; PHP aborting the request outright is fine too.
+if ($isRaw) {
+  @set_time_limit(0);
+  @ini_set('zlib.output_compression', 'Off');
+  @ini_set('implicit_flush', '1');
+  while (ob_get_level() > 0) {
+    if (!@ob_end_flush()) break;
+  }
+  ob_implicit_flush(true);
+  if (!$hasLen || $bodyLen >= $FB_RAW_NOBUFFER) {
+    header('X-Accel-Buffering: no');
+  }
+  ignore_user_abort(false);
 }
 
 // ---------------------------------------------------------------------------
@@ -512,6 +574,49 @@ $timed_out = function ($sock) {
   return !empty($meta['timed_out']);
 };
 
+/**
+ * An empty read means one of three things and they are not the same: end of
+ * body (feof), a read that merely hit the socket's inactivity timeout, or an
+ * error. Treating the middle case as "done" is what silently truncates a stream
+ * whose producer went quiet for a while - a disk spinning up, a 7zz extraction
+ * inside an archive, a daemon busy elsewhere - leaving the client a short body
+ * against an honest Content-Length and no way to tell it was cut.
+ *
+ * So on an fs/raw body we go back and wait again, for as long as the client is
+ * still there and the daemon has not been silent for $FB_RAW_STALL ($giveUp is
+ * the caller's per-stall state; a byte from the daemon resets it). Non-raw
+ * responses keep the old behaviour: the daemon holds a 30 s deadline on those,
+ * so silence past $FB_TIMEOUT means it is wedged, not slow.
+ */
+$keep_waiting = function (&$giveUp) use ($sock, $timed_out, $isRaw, $FB_RAW_STALL) {
+  if (feof($sock)) return false;                    // end of body
+  if (!$timed_out($sock)) return false;             // a real read error
+  if (!$isRaw) return false;                        // bounded response: wedged
+  if (connection_aborted()) return false;           // nobody left to stream to
+  if ($giveUp === null) $giveUp = time() + $FB_RAW_STALL;
+  return time() < $giveUp;                          // else: daemon gone quiet
+};
+
+/** Body bytes from the daemon; '' only when the body is really over. */
+$read_body = function ($max) use ($sock, $keep_waiting) {
+  $giveUp = null;
+  while (true) {
+    $buf = @fread($sock, $max);
+    if ($buf !== false && $buf !== '') return $buf;
+    if (!$keep_waiting($giveUp)) return '';
+  }
+};
+
+/** One framing line (chunk sizes); false only when the body is really over. */
+$read_line = function ($max) use ($sock, $keep_waiting) {
+  $giveUp = null;
+  while (true) {
+    $line = @fgets($sock, $max);
+    if ($line !== false && $line !== '') return $line;
+    if (!$keep_waiting($giveUp)) return false;
+  }
+};
+
 if ($status === 204 || $status === 304) {
   // no body
 
@@ -519,7 +624,7 @@ if ($status === 204 || $status === 304) {
   // ---- chunked transfer coding: decode, emit plain ------------------------
   $stop = false;
   while (!$stop && !feof($sock)) {
-    $line = @fgets($sock, 1024);
+    $line = $read_line(1024);
     if ($line === false) break;
     $line = trim($line);
     if ($line === '') continue;                       // CRLF between chunks
@@ -530,8 +635,8 @@ if ($status === 204 || $status === 304) {
     $remaining = hexdec($line);
     if ($remaining === 0) break;                      // last chunk (trailers ignored)
     while ($remaining > 0) {
-      $buf = @fread($sock, min($FB_CHUNK, $remaining));
-      if ($buf === false || $buf === '') {            // EOF or read timeout
+      $buf = $read_body(min($FB_CHUNK, $remaining));
+      if ($buf === '') {                              // end of body
         $stop = true;
         break;
       }
@@ -549,8 +654,8 @@ if ($status === 204 || $status === 304) {
   // ---- Content-Length framing --------------------------------------------
   $remaining = $bodyLen;
   while ($remaining > 0 && !feof($sock)) {
-    $buf = @fread($sock, min($FB_CHUNK, $remaining));
-    if ($buf === false || $buf === '') break;
+    $buf = $read_body(min($FB_CHUNK, $remaining));
+    if ($buf === '') break;
     $remaining -= strlen($buf);
     if (!$emit($buf)) break;
   }
@@ -558,12 +663,8 @@ if ($status === 204 || $status === 304) {
 } else {
   // ---- read until the daemon closes (we asked for Connection: close) ------
   while (!feof($sock)) {
-    $buf = @fread($sock, $FB_CHUNK);
-    if ($buf === false || $buf === '') {
-      if ($timed_out($sock)) break;
-      if (feof($sock)) break;
-      continue;
-    }
+    $buf = $read_body($FB_CHUNK);
+    if ($buf === '') break;
     if (!$emit($buf)) break;
   }
 }

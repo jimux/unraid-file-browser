@@ -4,11 +4,13 @@ import { getIndexConfig } from "./api/client";
 import { TopBar, type ViewMode } from "./components/TopBar";
 import { TreeSidebar } from "./components/TreeSidebar";
 import { BrowserView, type SortState } from "./views/BrowserView";
+import { PlayerView } from "./views/PlayerView";
 import { SearchView } from "./views/SearchView";
 import { SettingsView } from "./views/SettingsView";
 import { ViewerPanel } from "./views/ViewerPanel";
 import { useRoute } from "./hooks/useRoute";
 import { useTheme } from "./hooks/useTheme";
+import { isMedia, openPlayer } from "./lib/media";
 import { browseHref, navigate, viewHref } from "./lib/router";
 import { parentPath } from "./lib/paths";
 
@@ -23,8 +25,13 @@ export default function App() {
   const [sort, setSort] = useState<SortState>({ key: "name", dir: "asc", dirsFirst: true });
   const [reloadNonce, setReloadNonce] = useState(0);
 
+  // The player is a standalone document in its own window: no tree, no topbar,
+  // and no reason to spend a proxy round-trip on the index config.
+  const isPlayer = route.name === "play";
+
   // Configured roots drive the tree and the default landing directory.
   useEffect(() => {
+    if (isPlayer) return;
     let alive = true;
     const ac = new AbortController();
     getIndexConfig(ac.signal)
@@ -40,7 +47,7 @@ export default function App() {
       alive = false;
       ac.abort();
     };
-  }, []);
+  }, [isPlayer]);
 
   const defaultPath = roots[0] ?? FALLBACK_ROOTS[0];
 
@@ -63,12 +70,40 @@ export default function App() {
   }, [route.name, browsePath]);
 
   const go = useCallback((p: string) => navigate(browseHref(p)), []);
-  const openFile = useCallback((p: string) => navigate(viewHref(p)), []);
-  const openEntry = useCallback((e: Entry) => openFile(e.path), [openFile]);
+
+  /**
+   * Default action for a file. Video and audio open the standalone player in
+   * their own window (falling back to an in-place navigation when the popup is
+   * blocked); everything else opens the viewer panel. `mime` is optional so a
+   * caller that only has a path still gets the viewer.
+   */
+  const openFile = useCallback((p: string, mime?: string) => {
+    if (isMedia(mime)) openPlayer(p);
+    else navigate(viewHref(p));
+  }, []);
+
+  /**
+   * The browser view's own open. Same as `openFile`, except the player URL
+   * carries the sort this grid is showing, so the player's ↑/↓ walk the
+   * siblings in exactly the order the user sees behind it. Callers without a
+   * meaningful order (search results, the viewer panel) use `openFile` and get
+   * the name/asc default.
+   */
+  const openEntry = useCallback(
+    (e: Entry) => {
+      if (isMedia(e.mime)) openPlayer(e.path, { sort: sort.key, dir: sort.dir });
+      else navigate(viewHref(e.path));
+    },
+    [sort.key, sort.dir],
+  );
+  /** Secondary action: the viewer panel, even for media (its Media tab replays). */
+  const openDetails = useCallback((e: Entry) => navigate(viewHref(e.path)), []);
   const closeViewer = useCallback(() => navigate(browseHref(browsePath)), [browsePath]);
 
   const mode: ViewMode = route.name === "search" ? "search" : route.name === "settings" ? "settings" : "browse";
   const showBrowser = route.name === "browse" || route.name === "view" || route.name === "unknown";
+
+  if (route.name === "play") return <PlayerView path={route.path} sort={route.sort} dir={route.dir} />;
 
   return (
     <div className="app">
@@ -86,6 +121,7 @@ export default function App() {
                 onSortChange={setSort}
                 onNavigate={go}
                 onOpenFile={openEntry}
+                onOpenDetails={openDetails}
                 reloadNonce={reloadNonce}
                 inert={route.name === "view"}
               />
