@@ -174,4 +174,4 @@ _(Browse roots)_:
 ### _(Index configuration)_
 
 _(Index roots, the crawl schedule, content-indexing rules and the file-size cap live in the daemon's own configuration and are edited inside the app: open)_
-**[_(Tools)_ &rarr; _(File Browser)_](/Tools/FileBrowser)** _(and use its Settings panel. They are stored in the data directory above, not on the flash drive.)_
+**[_(File Browser)_](/FileBrowser)** _(top-level tab)_ _(and use its Settings panel. They are stored in the data directory above, not on the flash drive.)_

@@ -1,4 +1,5 @@
-Menu="Tools"
+Menu="Tasks:85"
+Type="xmenu"
 Title="File Browser"
 Icon="folder-open-o"
 Tag="folder-open-o"

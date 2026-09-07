@@ -9,7 +9,7 @@ plugin/
 ├── filebrowser.plg                 install manifest (XML) - shipped to users
 ├── README.md                       this file
 └── source/filebrowser/             -> /usr/local/emhttp/plugins/filebrowser/
-    ├── FileBrowser.page            Tools > File Browser (hosts the SPA)
+    ├── FileBrowser.page            top-level "File Browser" tab (hosts the SPA)
     ├── FileBrowserSettings.page    Settings > User Utilities > File Browser Settings
     ├── proxy.php                   auth bridge: webGUI -> unix socket
     ├── rc.filebrowserd             start|stop|restart|status
@@ -220,7 +220,7 @@ upgradepkg --install-new --reinstall /boot/config/plugins/filebrowser/filebrowse
 ```
 
 The webGUI picks up new `.page` files immediately - just reload the browser.
-`Tools -> File Browser` and `Settings -> User Utilities -> File Browser
+The top-level `File Browser` tab and `Settings -> User Utilities -> File Browser
 Settings` should both appear.
 
 Faster loop while iterating on the PHP/pages only (no repackaging):

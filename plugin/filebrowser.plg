@@ -5,7 +5,7 @@
 <!ENTITY author "James Smyth">
 <!ENTITY version "0000.00.00">
 <!ENTITY md5 "00000000000000000000000000000000">
-<!ENTITY launch "Tools/FileBrowser">
+<!ENTITY launch "FileBrowser">
 <!ENTITY github "jimux/unraid-file-browser">
 <!ENTITY plugdir "/usr/local/emhttp/plugins/&name;">
 <!ENTITY bootdir "/boot/config/plugins/&name;">
@@ -26,7 +26,10 @@
 <CHANGES>
 ##File Browser
 
-###2026.09.01
+###2026.09.07a
+- File Browser is now its own top-level tab instead of an entry under Tools
+
+###2026.09.07
 - Initial release
 - Array-wide file browser with name/metadata/content search (SQLite FTS5)
 - In-browser viewer with selectable text encodings, hex view and image preview
