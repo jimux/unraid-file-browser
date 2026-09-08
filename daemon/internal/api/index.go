@@ -58,7 +58,18 @@ func configResponse(idx IndexService) configData {
 	if roots == nil {
 		roots = []string{}
 	}
-	return configData{Config: idx.Config(), AllowedRoots: roots}
+	cfg := idx.Config()
+	// JSON clients index these lists; never hand them null.
+	if cfg.Roots == nil {
+		cfg.Roots = []string{}
+	}
+	if cfg.Content.IncludePaths == nil {
+		cfg.Content.IncludePaths = []string{}
+	}
+	if cfg.Content.Extensions == nil {
+		cfg.Content.Extensions = []string{}
+	}
+	return configData{Config: cfg, AllowedRoots: roots}
 }
 
 // readBody reads a small JSON request body. http.MaxBytesReader (rather than

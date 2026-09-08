@@ -26,6 +26,10 @@
 <CHANGES>
 ##File Browser
 
+###2026.09.07d
+- Fix: updates were recorded as installed without actually installing (Unraid's upgradepkg skipped the package as "not newer"); the installer now replaces the package explicitly and verifies the installed version
+- Fix: Settings crashed with "Cannot read properties of null (reading 'map')" when the index config had never been saved (unset lists were serialised as null)
+
 ###2026.09.07c
 - Right-click context menu on files, folders and archives (open, play, view as text/hex, details, download, copy path/name); also in search results and the player
 - Known video/audio extensions are treated as media regardless of the reported type; "Play as media" on any file
@@ -112,11 +116,36 @@ if [ -x "${RC}" ]; then
 fi
 
 # --- install -------------------------------------------------------------
-upgradepkg --install-new "${PKG}"
-if [ $? -ne 0 ]; then
-  echo "ERROR: upgradepkg failed for ${PKG}"
+# Not upgradepkg: Unraid's patched upgradepkg compares version strings and
+# silently SKIPS (exit 0) when it judges the installed package newer -- it
+# considered 2026.09.07 newer than 2026.09.07c, so three updates "succeeded"
+# without installing anything. Remove the old record explicitly, install the
+# new package, then verify the result instead of trusting an exit code.
+pkg_short_name() {
+  # filebrowser-2026.09.07c-x86_64-1 -> filebrowser (strip version-arch-build)
+  printf '%s' "$1" | sed -E 's/-[^-]+-[^-]+-[^-]+$//'
+}
+NEWNAME=$(basename "${PKG}" .txz)
+for old in /var/log/packages/${PLUGIN}-*; do
+  [ -e "${old}" ] || continue
+  oldname=$(basename "${old}")
+  # exact package-name match only, so an unrelated "filebrowser-foo" is untouched
+  [ "$(pkg_short_name "${oldname}")" = "${PLUGIN}" ] || continue
+  echo "Removing installed package ${oldname}"
+  removepkg "${oldname}" >/dev/null 2>&1 || echo "WARNING: removepkg ${oldname} reported an error; continuing"
+done
+
+installpkg "${PKG}"
+if [ $? -ne 0 ] || [ ! -e "/var/log/packages/${NEWNAME}" ]; then
+  echo "ERROR: installpkg did not install ${NEWNAME}"
   exit 1
 fi
+INSTALLED_VER=$(cat "${PLUGDIR}/VERSION" 2>/dev/null)
+if [ "${INSTALLED_VER}" != "${VERSION}" ]; then
+  echo "ERROR: installed files report version '${INSTALLED_VER}', expected '${VERSION}'"
+  exit 1
+fi
+echo "Installed ${NEWNAME}"
 
 # --- prune superseded packages from the flash drive ----------------------
 for old in "${BOOT}/${PLUGIN}"-*-x86_64-1.txz; do
@@ -197,10 +226,13 @@ fi
 rm -f /var/run/filebrowserd.sock /var/run/filebrowserd.pid
 
 # --- remove the Slackware package ---------------------------------------
-# Version independent: remove every installed filebrowser-<version> package.
+# Version independent: remove every installed filebrowser-<version> package,
+# matching on the exact package name so an unrelated filebrowser-foo survives.
 for pkg in /var/log/packages/${PLUGIN}-*; do
   [ -e "${pkg}" ] || continue
-  removepkg "$(basename "${pkg}")"
+  name=$(basename "${pkg}")
+  [ "$(printf '%s' "${name}" | sed -E 's/-[^-]+-[^-]+-[^-]+$//')" = "${PLUGIN}" ] || continue
+  removepkg "${name}"
 done
 
 # --- remove what is left of the webGUI tree -----------------------------

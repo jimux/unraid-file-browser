@@ -215,7 +215,8 @@ scp dist/filebrowser-<version>-x86_64-1.txz root@tower:/boot/config/plugins/file
 scp dist/filebrowser.plg                    root@tower:/boot/config/plugins/
 
 # on the server
-upgradepkg --install-new --reinstall /boot/config/plugins/filebrowser/filebrowser-<version>-x86_64-1.txz
+removepkg filebrowser-<old-version>-x86_64-1   # Unraid's upgradepkg may silently skip; see the .plg install script
+installpkg /boot/config/plugins/filebrowser/filebrowser-<version>-x86_64-1.txz
 /usr/local/emhttp/plugins/filebrowser/rc.filebrowserd restart
 ```
 
@@ -231,7 +232,7 @@ ssh root@tower chmod 755 /usr/local/emhttp/plugins/filebrowser/rc.filebrowserd \
                           /usr/local/emhttp/plugins/filebrowser/event/*
 ```
 
-Note this is overwritten by the next `upgradepkg`, and `/usr/local/emhttp` is
+Note this is overwritten by the next package install, and `/usr/local/emhttp` is
 on tmpfs - it does not survive a reboot. Anything permanent has to go through
 the txz.
 

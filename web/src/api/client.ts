@@ -228,7 +228,23 @@ export function indexStatus(signal?: AbortSignal): Promise<IndexStatus> {
 
 /** Normalise a possibly-old daemon that omits `allowedRoots`. */
 function asConfigResult(d: IndexConfigResult): IndexConfigResult {
-  return { config: d.config, allowedRoots: Array.isArray(d.allowedRoots) ? d.allowedRoots : [] };
+  // Older daemons serialise unset lists as null; never let a null reach .map().
+  const c = d.config ?? ({} as IndexConfig);
+  const content = c.content ?? ({} as IndexConfig["content"]);
+  const config: IndexConfig = {
+    ...c,
+    roots: Array.isArray(c.roots) ? c.roots : [],
+    schedule: c.schedule ?? "0 3 * * *",
+    parallelism: c.parallelism ?? 2,
+    content: {
+      ...content,
+      enabled: !!content.enabled,
+      includePaths: Array.isArray(content.includePaths) ? content.includePaths : [],
+      extensions: Array.isArray(content.extensions) ? content.extensions : [],
+      maxFileBytes: content.maxFileBytes ?? 10485760,
+    },
+  };
+  return { config, allowedRoots: Array.isArray(d.allowedRoots) ? d.allowedRoots : [] };
 }
 
 /** Returns the config *and* the browse roots it must stay inside. */
