@@ -1,0 +1,238 @@
+<?xml version='1.0' standalone='yes'?>
+
+<!DOCTYPE PLUGIN [
+<!ENTITY name "filebrowser-ffmpeg">
+<!ENTITY author "James Smyth">
+<!ENTITY version "7.0.2">
+<!ENTITY md5 "00000000000000000000000000000000">
+<!ENTITY github "jimux/unraid-file-browser">
+<!ENTITY bindir "/usr/local/filebrowser/bin">
+<!ENTITY bootdir "/boot/config/plugins/&name;">
+<!ENTITY package "&name;-&version;-x86_64-1.txz">
+<!ENTITY pluginURL "https://github.com/&github;/releases/latest/download/&name;.plg">
+<!ENTITY packageURL "https://github.com/&github;/releases/download/ffmpeg-v&version;/&package;">
+]>
+
+<PLUGIN name="&name;"
+        author="&author;"
+        version="&version;"
+        pluginURL="&pluginURL;"
+        support="https://github.com/&github;/issues"
+        icon="film"
+        min="6.12.0">
+
+<CHANGES>
+##File Browser ffmpeg
+
+###7.0.2
+- ffmpeg and ffprobe 7.0.2, fully-static Linux x64 build from johnvansickle.com (GPL v3)
+- Installs to /usr/local/filebrowser/bin/ - a private directory, so it cannot clash with an ffmpeg installed another way
+- Enables transcoding and media probing in the File Browser plugin (HLS remux/transcode, quality switch, right-click Play)
+- Decoders: h264, hevc, mpeg4, mpeg2, vc1, vp9, av1, dts, ac3, eac3, aac, mp3; encoders: libx264, aac; muxers: mpegts, mp4
+- No VAAPI hardware acceleration: it needs runtime-linked libva, which a fully-static binary cannot use
+- RAM cost: /usr/local is a tmpfs RAM disk on Unraid, and the two binaries together add roughly 152 MB to it (~76 MB each)
+</CHANGES>
+
+<!--
+File Browser ffmpeg companion plugin
+Copyright 2026, James Smyth
+
+This plugin ships nothing but the two ffmpeg binaries. It exists because the
+plugin manager re-downloads the whole package and rewrites it to the USB boot
+flash on every update: bundling 190 MB of ffmpeg inside the 5 MB file browser
+would have meant 190 MB of flash writes for every file-browser release. Split
+out and versioned by ffmpeg's own version, the big package is only rewritten
+when ffmpeg itself is bumped.
+
+Layout installed by the package:
+
+  /usr/local/filebrowser/bin/ffmpeg    fully-static ffmpeg 7.0.2 (GPL v3), ~76 MB
+  /usr/local/filebrowser/bin/ffprobe   fully-static ffprobe 7.0.2 (GPL v3), ~76 MB
+
+The directory is private to the file browser on purpose. filebrowserd searches
+/usr/local/filebrowser/bin, then /usr/local/sbin (installs predating the
+split), then $PATH - so this plugin can neither shadow nor be shadowed by an
+ffmpeg the admin installed another way.
+
+The two plugins are independent and may be installed in either order; neither
+requires the other to be present.
+
+FFmpeg is licensed under the GNU General Public License version 3. The build is
+the unmodified johnvansickle.com static release; sources for the corresponding
+version are at https://git.ffmpeg.org/ffmpeg.git (tag n7.0.2) and
+https://johnvansickle.com/ffmpeg/. filebrowserd invokes these binaries as
+separate processes and does not link against them.
+
+The 'version' and 'md5' entity declarations above are rewritten in place by
+`make package-ffmpeg` (see the Makefile) with a literal sed pattern, so those
+two lines must keep exactly one space between the entity name and its quoted
+value. Do not realign them with the others.
+-->
+
+<!--
+The 'source' package. Downloaded to the flash drive and verified against the
+MD5 that `make package-ffmpeg` stamped into the manifest.
+-->
+<FILE Name="&bootdir;/&package;">
+<URL>&packageURL;</URL>
+<MD5>&md5;</MD5>
+</FILE>
+
+<!--
+The 'install' script.
+-->
+<FILE Run="/bin/bash">
+<INLINE>
+PLUGIN="&name;"
+VERSION="&version;"
+BINDIR="&bindir;"
+<![CDATA[
+BOOT="/boot/config/plugins/${PLUGIN}"
+FBRC="/usr/local/emhttp/plugins/filebrowser/rc.filebrowserd"
+
+# The entities above are expanded by the plugin manager. If a future XML parser
+# ever hands the CDATA through unexpanded, fall back to the newest package that
+# was staged on the flash drive so the install still resolves a real file.
+case "${VERSION}" in
+  ''|*'&'*)
+    VERSION=$(ls -1 "${BOOT}/${PLUGIN}"-*-x86_64-1.txz 2>/dev/null \
+              | sed -n "s|.*/${PLUGIN}-\(.*\)-x86_64-1.txz|\1|p" | sort | tail -1)
+    ;;
+esac
+case "${BINDIR}" in
+  ''|*'&'*) BINDIR="/usr/local/filebrowser/bin" ;;
+esac
+PKG="${BOOT}/${PLUGIN}-${VERSION}-x86_64-1.txz"
+
+if [ ! -f "${PKG}" ]; then
+  echo "ERROR: package ${PKG} not found on the flash drive"
+  exit 1
+fi
+
+# --- install -------------------------------------------------------------
+# Not upgradepkg: Unraid's patched upgradepkg compares version strings and
+# silently SKIPS (exit 0) when it judges the installed package "not newer" --
+# on the main plugin that made three updates "succeed" without installing
+# anything. Remove the old record explicitly, install the new package, then
+# verify the result instead of trusting an exit code.
+pkg_short_name() {
+  # filebrowser-ffmpeg-7.0.2-x86_64-1 -> filebrowser-ffmpeg (strip version-arch-build)
+  printf '%s' "$1" | sed -E 's/-[^-]+-[^-]+-[^-]+$//'
+}
+NEWNAME=$(basename "${PKG}" .txz)
+for old in /var/log/packages/${PLUGIN}-*; do
+  [ -e "${old}" ] || continue
+  oldname=$(basename "${old}")
+  # exact package-name match only, so an unrelated package is untouched
+  [ "$(pkg_short_name "${oldname}")" = "${PLUGIN}" ] || continue
+  echo "Removing installed package ${oldname}"
+  removepkg "${oldname}" >/dev/null 2>&1 || echo "WARNING: removepkg ${oldname} reported an error; continuing"
+done
+
+installpkg "${PKG}"
+if [ $? -ne 0 ] || [ ! -e "/var/log/packages/${NEWNAME}" ]; then
+  echo "ERROR: installpkg did not install ${NEWNAME}"
+  exit 1
+fi
+
+# --- verify the binaries are really there and really run -----------------
+# An exit code is not proof: check the files exist, are executable, and report
+# a version. Fail loudly rather than leave the plugin "installed" but useless.
+for bin in ffmpeg ffprobe; do
+  if [ ! -f "${BINDIR}/${bin}" ]; then
+    echo "ERROR: ${BINDIR}/${bin} was not installed"
+    exit 1
+  fi
+  if [ ! -x "${BINDIR}/${bin}" ]; then
+    chmod 0755 "${BINDIR}/${bin}" 2>/dev/null
+  fi
+  if [ ! -x "${BINDIR}/${bin}" ]; then
+    echo "ERROR: ${BINDIR}/${bin} is not executable"
+    exit 1
+  fi
+  REPORTED=$("${BINDIR}/${bin}" -version 2>/dev/null | head -1)
+  if [ -z "${REPORTED}" ]; then
+    echo "ERROR: ${BINDIR}/${bin} did not run"
+    exit 1
+  fi
+  echo "  ${REPORTED}"
+done
+echo "Installed ${NEWNAME}"
+
+# --- prune superseded packages from the flash drive ----------------------
+for old in "${BOOT}/${PLUGIN}"-*-x86_64-1.txz; do
+  [ -f "${old}" ] || continue
+  [ "${old}" = "${PKG}" ] && continue
+  echo "Removing old package $(basename "${old}")"
+  rm -f "${old}"
+done
+
+# --- let a running file browser notice the new binaries ------------------
+# filebrowserd probes for ffmpeg when it starts, so a daemon that was already
+# running still believes transcoding is unavailable. Restarting it here is what
+# makes the two plugins installable in either order. Absent or stopped daemon:
+# nothing to do, it will find the binaries at its next start.
+if [ -x "${FBRC}" ] && "${FBRC}" status >/dev/null 2>&1; then
+  echo "Restarting filebrowserd so it picks up ffmpeg ..."
+  "${FBRC}" restart || true
+fi
+
+echo ""
+echo "-----------------------------------------------------------"
+echo " ${PLUGIN} has been installed."
+echo " ffmpeg and ffprobe ${VERSION} are in ${BINDIR}"
+echo " FFmpeg is licensed under the GNU GPL version 3."
+echo " Copyright 2026, James Smyth"
+echo "-----------------------------------------------------------"
+echo ""
+]]>
+</INLINE>
+</FILE>
+
+<!--
+The 'remove' script. Removes the package and the private bin directory. The
+parent /usr/local/filebrowser is left alone in case anything else ever lives
+under it.
+-->
+<FILE Run="/bin/bash" Method="remove">
+<INLINE>
+PLUGIN="&name;"
+BINDIR="&bindir;"
+<![CDATA[
+FBRC="/usr/local/emhttp/plugins/filebrowser/rc.filebrowserd"
+
+case "${BINDIR}" in
+  ''|*'&'*) BINDIR="/usr/local/filebrowser/bin" ;;
+esac
+
+# --- remove the Slackware package ---------------------------------------
+# Version independent: remove every installed filebrowser-ffmpeg-<version>
+# package, matching on the exact package name so the main filebrowser package
+# (and anything else) survives.
+for pkg in /var/log/packages/${PLUGIN}-*; do
+  [ -e "${pkg}" ] || continue
+  name=$(basename "${pkg}")
+  [ "$(printf '%s' "${name}" | sed -E 's/-[^-]+-[^-]+-[^-]+$//')" = "${PLUGIN}" ] || continue
+  removepkg "${name}"
+done
+
+# --- remove what is left of the private bin directory -------------------
+rm -rf "${BINDIR}"
+
+# --- let a running file browser notice ffmpeg is gone -------------------
+if [ -x "${FBRC}" ] && "${FBRC}" status >/dev/null 2>&1; then
+  "${FBRC}" restart || true
+fi
+
+echo ""
+echo "-----------------------------------------------------------"
+echo " ${PLUGIN} has been uninstalled."
+echo " The File Browser plugin keeps working; transcoding is"
+echo " simply reported as unavailable until ffmpeg is reinstalled."
+echo "-----------------------------------------------------------"
+echo ""
+]]>
+</INLINE>
+</FILE>
+
+</PLUGIN>

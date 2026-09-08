@@ -58,6 +58,98 @@ export interface IndexStatus {
   progress?: number;
 }
 
+/* ------------------------------------------------------- media (HLS) types */
+
+/**
+ * `GET /media/capabilities` — is server-side transcoding possible at all?
+ * Never errors; everything but `available` and `reason` is diagnostics.
+ */
+export interface MediaCapabilities {
+  available: boolean;
+  /** Versions, "" when the binary is missing. */
+  ffmpeg: string;
+  ffprobe: string;
+  ffmpegPath?: string;
+  ffprobePath?: string;
+  hwaccels: string[];
+  encoders: string[];
+  /** Hardware encoder the daemon tries first; absent = software only. */
+  hwEncoder?: string;
+  /** Why `available` is false — quoted verbatim in the player's card. */
+  reason?: string;
+}
+
+export interface ProbeVideoStream {
+  index: number;
+  codec: string;
+  profile: string;
+  width: number;
+  height: number;
+  fps: number;
+  bitrate: number;
+}
+
+export interface ProbeAudioStream {
+  index: number;
+  codec: string;
+  channels: number;
+  lang: string;
+  title: string;
+  default: boolean;
+}
+
+export interface ProbeSubtitleStream {
+  index: number;
+  codec: string;
+  lang: string;
+  title: string;
+}
+
+/** `GET /media/probe?path=` — what ffprobe found inside the container. */
+export interface MediaProbe {
+  container: string;
+  durationSec: number;
+  bitrate: number;
+  video: ProbeVideoStream | null;
+  audio: ProbeAudioStream[];
+  subtitles: ProbeSubtitleStream[];
+}
+
+/** remux = container rewrap only; transcode = at least one stream re-encoded. */
+export type MediaSessionMode = "remux" | "transcode";
+
+/** `POST /media/session` — a live HLS session on the daemon. */
+export interface MediaSession {
+  /** 32 hex chars. */
+  id: string;
+  mode: MediaSessionMode;
+  /** Human sentence explaining the mode, e.g. "mpeg4 video is not supported". */
+  reason: string;
+  durationSec: number;
+  segmentSec: number;
+  segmentCount: number;
+  /** Full API path, e.g. "/api/v1/media/hls/<id>/index.m3u8". */
+  playlist: string;
+  /** null for an audio-only session. `bitrate` is 0 when the stream is copied. */
+  video: { codec: string; width: number; height: number; bitrate: number; copied: boolean } | null;
+  audio: { codec: string; channels: number; lang: string; index: number; copied: boolean } | null;
+}
+
+export interface MediaSessionParams {
+  path: string;
+  /** Short codec names this browser can decode — see lib/codecs.ts. */
+  can: string[];
+  /** ffprobe stream index of the audio track to use; omitted = daemon default. */
+  audioIndex?: number;
+  /**
+   * Cap the output height (1080/720/480); omitted = keep the source height.
+   * Below the source height this forces a scaling transcode even when the
+   * codec was already playable — the user asked for less. At or above it, it
+   * never upscales.
+   */
+  maxHeight?: number;
+}
+
 /* ---- endpoint response payloads (the `data` side of the envelope) ---- */
 
 export interface ListResult {
@@ -171,5 +263,7 @@ export type ApiErrorCode =
   | "ARCHIVE_ERROR"
   | "ENCODING_ERROR"
   | "INDEXING"
+  /** 503 from the media endpoints: ffmpeg/ffprobe are not installed. */
+  | "UNAVAILABLE"
   | "INTERNAL"
   | "NETWORK";

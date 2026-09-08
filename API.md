@@ -18,9 +18,11 @@ JSON endpoints:
 
 Error codes: `BAD_REQUEST`, `NOT_FOUND`, `FORBIDDEN` (outside roots),
 `TOO_LARGE`, `TIMEOUT`, `ARCHIVE_ERROR`, `ENCODING_ERROR`, `INDEXING` (index
-busy/unavailable), `INTERNAL`. HTTP status mirrors the class (400/404/403/
-413/504/422/503/500). Raw endpoints (`fs/raw`) stream bytes and use plain HTTP
-statuses.
+busy/unavailable), `UNAVAILABLE` (an optional subsystem is not installed on
+this host — media transcoding without ffmpeg; static until reinstall, do not
+retry), `INTERNAL`. HTTP status mirrors the class (400/404/403/413/504/422/
+503/503/500). Raw endpoints (`fs/raw`, HLS playlists and segments) stream
+bytes and use plain HTTP statuses; their *errors* are still JSON envelopes.
 
 ## Types
 
@@ -142,6 +144,87 @@ interface IndexConfig {
 - `POST /index/rescan` body `{ path?: string }` — full rescan, or subtree only.
 - `POST /index/pause`, `POST /index/resume`
 
+### Media (on-the-fly HLS)
+
+See the **Transcoding** section for what these do and why. `ENCODING_ERROR`
+(422) is the code for "ffmpeg/ffprobe could not read or convert this file";
+`UNAVAILABLE` (503) means ffmpeg is not installed at all.
+
+- `GET /media/capabilities` → never errors.
+  ```ts
+  { available: boolean;
+    ffmpeg: string; ffprobe: string;          // versions, "" when missing
+    ffmpegPath?: string; ffprobePath?: string;
+    hwaccels: string[];                       // `ffmpeg -hwaccels` (informational)
+    encoders: string[];                       // H.264/HEVC/AAC encoders this build offers, e.g. ["aac","libx264"]
+    hwEncoder?: string;                       // hardware encoder the daemon will try first, absent = software only
+    reason?: string }                         // why available is false
+  ```
+- `GET /media/probe?path=<p>` → `{ probe: Probe }`. Real files only: a
+  virtual (archive) path is `BAD_REQUEST`. ffprobe has 20 s and 4 MB of JSON.
+  ```ts
+  interface Probe {
+    container: string;               // ffprobe format_name, e.g. "matroska,webm"
+    durationSec: number;             // 0 when unknown
+    bitrate: number;                 // bits/s, 0 when unknown
+    video: { index: number; codec: string; profile: string; width: number;
+             height: number; fps: number; bitrate: number } | null;   // cover art is skipped
+    audio: { index: number; codec: string; channels: number; lang: string;
+             title: string; default: boolean }[];
+    subtitles: { index: number; codec: string; lang: string; title: string }[];
+  }
+  ```
+- `POST /media/session` body
+  `{ path: string; can: string[]; audioIndex?: number; maxHeight?: number }`
+  → `{ session: Session }`.
+  `can` is the browser's codec list (`["h264","vp9","aac","opus","mp3"]`;
+  aliases like `h.264`, `h265`, `mp4a` are understood). Empty = unknown →
+  everything is re-encoded to H.264/AAC. `audioIndex` is a `Probe.audio[].index`
+  (default: the track flagged default, else the first). `maxHeight` below the
+  source height **forces a video transcode with scaling** even when the codec
+  is playable (the user asked for less); at or above it never upscales.
+  ```ts
+  interface Session {
+    id: string;                      // 32 hex chars
+    mode: "remux" | "transcode";     // remux = every stream copied; transcode = at least one re-encoded
+    reason: string;                  // human-readable justification, e.g. "AC-3 audio is not supported by this browser"
+    durationSec: number; segmentSec: number; segmentCount: number;
+    playlist: string;                // "/api/v1/media/hls/<id>/index.m3u8"
+    video: { codec: string; width: number; height: number;
+             bitrate: number;        // ceiling applied when transcoding (bits/s); 0 when copied
+             copied: boolean } | null;
+    audio: { codec: string; channels: number; lang: string; index: number; copied: boolean } | null;
+  }
+  ```
+- `GET /media/hls/<id>/index.m3u8` → `application/vnd.apple.mpegurl`. A
+  complete **VOD** playlist generated up front from the probed duration
+  (`#EXT-X-PLAYLIST-TYPE:VOD`, `#EXT-X-TARGETDURATION`, one `#EXTINF` per
+  segment, `#EXT-X-ENDLIST`), so the player can seek anywhere immediately.
+  Segment URIs are **bare relative names** (`seg-00001.ts`); the SPA rewrites
+  them for the bridge. Each request touches the session (keeps it alive).
+- `GET /media/hls/<id>/seg-<NNNNN>.ts` → `video/mp2t`, produced on demand
+  and streamed as it is made (chunked, no `Content-Length`). `NNNNN` is
+  zero-padded, 5–7 digits, `0 ≤ N < segmentCount`; anything else is
+  `NOT_FOUND`. Nothing throttles a session: a player may pull segments back
+  to back as fast as ffmpeg produces them.
+- `POST /media/session/<id>/close` → `{ ok: true }` (as `data`). Idempotent;
+  the SPA calls it via `sendBeacon` on unload. Only GET and POST reach the
+  daemon through the bridge — there is no DELETE.
+
+Headers: every media response carries `X-Content-Type-Options: nosniff`.
+Playlists and JSON carry `Cache-Control: private, no-store`; segments carry
+`Cache-Control: private, max-age=3600` — a segment of a given session is
+immutable and its id unguessable, so the browser's own cache may keep it
+and a seek back does not cost a second transcode. Never a shared cache.
+
+Limits: at most **3** simultaneous ffmpeg processes (segment producers,
+probes and keyframe lookups share the pool; a request that cannot get a slot
+within **10 s** is `TIMEOUT` 504 "server busy"); at most **8** live sessions
+(the least recently used idle one is evicted for a new one; when all are
+busy the new one is refused with `TIMEOUT`); sessions expire after **10 min**
+idle; a segment has **60 s** of wall time; playlists are capped at
+**100 000** segments (`TOO_LARGE`).
+
 ### `GET /healthz`
 → `{ version, uptimeSec, indexDb: "ok"|"missing"|"error", roots: string[] }`
 `roots` are the browse roots the daemon was started with (`-roots`).
@@ -216,6 +299,60 @@ files; per-request wall clock 30s; decompressed bytes per entry read 256 MB (vie
 stream-and-stop, so viewing the head of a huge entry is still fine); nested
 archive layers larger than 512 MB compressed are extracted to a temp file in
 the data dir rather than memory.
+
+## Transcoding
+
+The SPA can only play what the browser decodes natively. For anything else
+(AVI, MKV with AC-3, HEVC, …) it asks the daemon for an HLS session and plays
+`index.m3u8` with hls.js. The daemon picks the **cheapest** treatment:
+
+- **remux** — every selected stream's codec is in `can` *and* can be carried
+  in MPEG-TS (H.264, HEVC, MPEG-2/4 video; AAC, MP3, MP2, AC-3, E-AC-3, Opus,
+  DTS audio): the container is the only problem, so streams are copied
+  (`-c copy`) — I/O-bound, no CPU to speak of. A browser may decode VP9 or FLAC
+  natively but TS has no mapping for them, so they are re-encoded regardless.
+- **transcode** — at least one stream is re-encoded, and **only** that one.
+  The very common MKV+H.264+AC-3 costs a single AAC encode; the video is
+  copied. Video is encoded with libx264 (`veryfast`, CRF 23, High@4.1,
+  yuv420p) under a bitrate ceiling from this ladder (`-maxrate`, `-bufsize` =
+  2×), by output height: ≤480p 1.5 Mbps, ≤720p 3 Mbps, ≤1080p 6 Mbps, above
+  12 Mbps. Audio is encoded to AAC 192 kbps stereo. The ceiling is reported in
+  `session.video.bitrate`. Hardware encoding (VAAPI) is tried first only when
+  `/dev/dri/renderD128` exists **and** the ffmpeg build lists `h264_vaapi`;
+  the bundled static build has neither, so software is the tested path. A
+  hardware failure falls back to software for the rest of the session.
+
+`reason` explains the choice in one sentence for the UI.
+
+**Segments are streamed, never stored.** A session is a small in-memory record
+(path, probe, chosen treatment, segment length). Each segment is produced by
+its own short-lived ffmpeg writing MPEG-TS to stdout, streamed straight to the
+client and killed the moment the client disconnects — nothing is written to
+the array or anywhere else, and aggressive prefetch costs only CPU. Every
+segment carries absolute timestamps (`-copyts`, plus a constant 1 s offset so
+segment 0's negative decode timestamps never make ffmpeg shift that one
+segment differently from the rest), so hls.js needs no discontinuity handling
+and a mid-file segment can be produced without any earlier one.
+
+Segment length: **4 s** when video is transcoded (a slow CPU still starts
+quickly); **10 s** when video is copied. Copied video can only be cut on
+keyframes: segment *n* runs from the keyframe ffmpeg's seek lands on for
+boundary *n* to the keyframe boundary *n+1* lands on, cut in decode order so
+consecutive segments are exactly contiguous; the daemon asks ffmpeg itself
+where each seek lands (a ~50 ms lookup, cached per session). Consequently
+`#EXTINF` values are nominal and real copied segments may start up to one
+segment early; hls.js realigns from the segments' own timestamps. At session
+creation the first boundaries are sampled, and a file whose keyframes are
+farther apart than the segment (GOP > 10 s) is transcoded instead — the
+`reason` says so — because copying it would alternate copied and re-encoded
+segments. Should a long GOP still turn up mid-file, only that one segment is
+re-encoded so coverage stays gapless.
+
+Security: the input is opened by the daemon's race-safe path walk and handed
+to ffmpeg as an inherited descriptor (`/dev/fd/3`); a user-derived path is
+never an ffmpeg argument. Fixed argv, no shell, `-nostdin`, and
+`-protocol_whitelist file,fd,pipe` so a crafted file cannot make ffmpeg open
+network URLs or other files.
 
 ## Dev mode
 

@@ -1,12 +1,27 @@
 # Unraid plugin packaging
 
 Everything in this directory is the Unraid side of the project: the `.plg`
-install manifest and the tree that becomes
+install manifests and the tree that becomes
 `/usr/local/emhttp/plugins/filebrowser/` on the server.
+
+**Two plugins are shipped**, independent of each other and installable in
+either order:
+
+| Manifest | Plugin | Version scheme | Package |
+| --- | --- | --- | --- |
+| `filebrowser.plg` | File Browser | date, `YYYY.MM.DD[a-z]` | `filebrowser-<version>-x86_64-1.txz` (~5 MB) |
+| `filebrowser-ffmpeg.plg` | File Browser ffmpeg | ffmpeg's own version, `7.0.2` | `filebrowser-ffmpeg-<version>-x86_64-1.txz` (~40 MB) |
+
+The split exists because the plugin manager re-downloads the whole package and
+rewrites it to the **USB boot flash** on every update. With ffmpeg inside, each
+file-browser release would have cost ~190 MB of flash writes for ~5 MB of
+changed app. Versioning the companion by ffmpeg's version means it is only
+rewritten when ffmpeg itself is bumped.
 
 ```
 plugin/
 ├── filebrowser.plg                 install manifest (XML) - shipped to users
+├── filebrowser-ffmpeg.plg          companion manifest: ffmpeg/ffprobe only
 ├── README.md                       this file
 └── source/filebrowser/             -> /usr/local/emhttp/plugins/filebrowser/
     ├── FileBrowser.page            top-level "File Browser" tab (hosts the SPA)
@@ -41,6 +56,9 @@ lands on the server - is:
 | `usr/local/sbin/filebrowserd` | `daemon/filebrowserd-linux-amd64` | static linux/amd64, mode 0755 |
 | `usr/local/sbin/7zz` | build cache | bundled static 7-Zip, mode 0755 |
 
+ffmpeg and ffprobe are deliberately **not** here - see the companion plugin
+below.
+
 Runtime paths that are *not* in the package:
 
 | Path | Purpose |
@@ -63,6 +81,76 @@ The daemon is started as
 `-roots` takes the **comma-separated** list verbatim from `BROWSE_ROOTS` (one
 argv element, quoted; embedded spaces in share names are fine). It is the
 daemon's confinement boundary and is deliberately boot-time only - see below.
+
+## The ffmpeg companion plugin
+
+`make package-ffmpeg` builds `dist/filebrowser-ffmpeg-<FFMPEG_VERSION>-x86_64-1.txz`
+from `plugin/filebrowser-ffmpeg.plg`. Its staged tree is two files:
+
+| Path in the txz | Source | Notes |
+| --- | --- | --- |
+| `usr/local/filebrowser/bin/ffmpeg` | build cache | fully-static ffmpeg 7.0.2 (johnvansickle GPL v3 build), mode 0755, ~76 MB |
+| `usr/local/filebrowser/bin/ffprobe` | build cache | fully-static ffprobe 7.0.2 (johnvansickle GPL v3 build), mode 0755, ~76 MB |
+
+Same ownership contract as the main package: forced `0/0`, and the build fails
+if any entry in the finished archive is not.
+
+> **RAM cost:** `/usr/local` is a tmpfs RAM disk on Unraid. The two ffmpeg
+> binaries together add approximately **152 MB** of RAM while this plugin is
+> installed (~76 MB each). That cost is now opt-in: an installation that never
+> transcodes simply does not install this plugin. `make package-ffmpeg`
+> downloads them into `build/cache/` (SHA-256 pinned and verified) on first run
+> and reuses the cached copies afterwards.
+
+**Why a private directory.** `/usr/local/filebrowser/bin` belongs to this
+plugin alone, so it can neither shadow nor be shadowed by an ffmpeg the admin
+installed another way (Nerd Tools, a Docker-adjacent build, a hand-copied
+binary in `/usr/local/sbin`). `filebrowserd` searches, in order:
+
+1. `/usr/local/filebrowser/bin` - the companion plugin
+2. `/usr/local/sbin` - installs that predate the split
+3. `$PATH`
+
+With none of them present the daemon reports `available: false` from
+`GET /api/v1/media/capabilities` and every media endpoint answers
+`UNAVAILABLE`; nothing else is affected.
+
+**Install order does not matter.** The daemon probes for ffmpeg when it starts,
+so the companion's install script restarts `filebrowserd` when it finds it
+running (`rc.filebrowserd status` exits 0), and the remove script does the same
+so a running daemon notices the binaries are gone. Whichever plugin is
+installed second is therefore picked up immediately.
+
+**Install script.** Same hard-won shape as the main plugin's, for the same
+reason: it does **not** use `upgradepkg`. Unraid's patched `upgradepkg`
+compares version strings and silently skips (exit 0) when it judges the
+installed package "not newer" - which is how three main-plugin updates once
+"succeeded" without installing anything. Instead it
+
+1. resolves the package on the flash drive (with the same unexpanded-entity
+   fallback the main manifest uses),
+2. `removepkg`s any installed package whose *exact* short name is
+   `filebrowser-ffmpeg` (so the main `filebrowser` package is never touched -
+   the short name is the file name minus `-version-arch-build`),
+3. `installpkg`s the new one and checks `/var/log/packages/<name>` exists,
+4. **verifies the result**: both binaries must exist, be executable
+   (`chmod 0755` is attempted first), and print a version when run - any
+   failure is a loud non-zero exit rather than a package recorded as installed
+   but useless,
+5. prunes superseded txz files from `/boot/config/plugins/filebrowser-ffmpeg/`,
+6. restarts `filebrowserd` if it is running.
+
+**Remove script.** `removepkg`s every exact-name `filebrowser-ffmpeg-*`
+package, `rm -rf`s `/usr/local/filebrowser/bin`, and restarts a running
+`filebrowserd`. The parent `/usr/local/filebrowser` is deliberately left alone
+in case anything else ever lives under it.
+
+**Licensing.** FFmpeg is GPL v3 and the disclosure lives with this plugin: the
+manifest's comment header names the license and the upstream source
+(`https://git.ffmpeg.org/ffmpeg.git`, tag `n7.0.2`), the install script prints
+it, and the full text stays in the repo at
+`third_party/licenses/ffmpeg-GPLv3.txt`. The daemon invokes the binaries as
+separate processes and does not link against them.
 
 ## Settings
 
@@ -177,6 +265,7 @@ one fails. The socket is closed on every exit path.
    ```sh
    make package                      # VERSION defaults to $(date +%Y.%m.%d)
    make package VERSION=2026.09.01a  # explicit (letter suffix for a same-day respin)
+   make package-all                  # both plugins in one go
    ```
 
    `make package` rewrites the two entity lines in a *copy* of the manifest and
@@ -204,6 +293,35 @@ one fails. The socket is closed on every exit path.
    `dist/filebrowser-<version>-x86_64-1.txz` and `dist/filebrowser.plg`
    attached.
 
+### The companion plugin's version
+
+`filebrowser-ffmpeg.plg` tracks **ffmpeg**, not the file browser, so a normal
+file-browser release does not touch it at all. Bump it only when ffmpeg itself
+is upgraded:
+
+1. Update `FFMPEG_VERSION`, `FFMPEG_URL` and `FFMPEG_SHA256` in the Makefile
+   together (verify the checksum across independent fetches - these binaries
+   run as root on every user's box), and `rm -f build/cache/ffmpeg
+   build/cache/ffprobe` so the new archive is actually fetched.
+2. Add a `###<ffmpeg version>` block to `<CHANGES>` in
+   `plugin/filebrowser-ffmpeg.plg`. The checked-in `<!ENTITY version …>` may
+   hold the real version (it is not a placeholder like the main plugin's),
+   but `make package-ffmpeg` still stamps `version` and `md5` into the `dist/`
+   copy with the same literal sed patterns, so those two lines must keep
+   exactly one space and double quotes.
+3. Publish a release tagged `ffmpeg-v<ffmpeg version>` - that is what the
+   `packageURL` entity resolves against - with
+   `dist/filebrowser-ffmpeg-<version>-x86_64-1.txz` and
+   `dist/filebrowser-ffmpeg.plg` attached.
+
+> **Attach both `.plg` files to every release.** Both manifests' `pluginURL`
+> resolves through `/releases/latest/download/`, which GitHub serves from the
+> single newest release of the repo, whatever it is for. A file-browser release
+> that ships only `filebrowser.plg` makes
+> `/releases/latest/download/filebrowser-ffmpeg.plg` 404 and breaks the
+> companion's "check for updates". The txz files stay pinned to their own tags
+> via `packageURL`, so only the small manifests need duplicating.
+
 ## Manual install for testing
 
 Without a release, install straight from the flash drive:
@@ -218,6 +336,22 @@ scp dist/filebrowser.plg                    root@tower:/boot/config/plugins/
 removepkg filebrowser-<old-version>-x86_64-1   # Unraid's upgradepkg may silently skip; see the .plg install script
 installpkg /boot/config/plugins/filebrowser/filebrowser-<version>-x86_64-1.txz
 /usr/local/emhttp/plugins/filebrowser/rc.filebrowserd restart
+```
+
+The companion, when you need transcoding on the test box:
+
+```sh
+# on the build host
+make package-ffmpeg
+ssh root@tower mkdir -p /boot/config/plugins/filebrowser-ffmpeg
+scp dist/filebrowser-ffmpeg-7.0.2-x86_64-1.txz root@tower:/boot/config/plugins/filebrowser-ffmpeg/
+scp dist/filebrowser-ffmpeg.plg                root@tower:/boot/config/plugins/
+
+# on the server
+removepkg filebrowser-ffmpeg-<old-version>-x86_64-1   # only if one is installed
+installpkg /boot/config/plugins/filebrowser-ffmpeg/filebrowser-ffmpeg-7.0.2-x86_64-1.txz
+/usr/local/filebrowser/bin/ffmpeg -version | head -1
+/usr/local/emhttp/plugins/filebrowser/rc.filebrowserd restart   # so it re-probes
 ```
 
 The webGUI picks up new `.page` files immediately - just reload the browser.
@@ -242,6 +376,9 @@ To exercise the full `.plg` path (download + MD5 + install script) point the
 ```sh
 plugin install /boot/config/plugins/filebrowser.plg
 plugin remove filebrowser.plg
+
+plugin install /boot/config/plugins/filebrowser-ffmpeg.plg
+plugin remove filebrowser-ffmpeg.plg
 ```
 
 Useful checks on the server:
@@ -250,12 +387,26 @@ Useful checks on the server:
 /usr/local/emhttp/plugins/filebrowser/rc.filebrowserd status
 tail -f /var/log/filebrowserd.log
 curl -s --unix-socket /var/run/filebrowserd.sock http://localhost/api/v1/healthz
+curl -s --unix-socket /var/run/filebrowserd.sock http://localhost/api/v1/media/capabilities
+ls -l /usr/local/filebrowser/bin
 ```
+
+The same *Transcoding* row is on `Settings -> User Utilities -> File Browser
+Settings`, which polls `/api/v1/media/capabilities` through `proxy.php` and
+shows either the detected ffmpeg version and path, or "Not installed" plus the
+companion plugin's install URL.
 
 ## Uninstall behaviour
 
 `plugin remove filebrowser.plg` stops the daemon, `removepkg`s every installed
-`filebrowser-*` package and deletes
+package whose exact short name is `filebrowser` (so `filebrowser-ffmpeg`
+survives - it is a different plugin) and deletes
 `/usr/local/emhttp/plugins/filebrowser/`. It deliberately keeps
 `/boot/config/plugins/filebrowser/` (settings) and the index in `DATA_DIR`, so
 reinstalling picks up where the user left off. Removing those is a manual `rm`.
+
+`plugin remove filebrowser-ffmpeg.plg` `removepkg`s every installed package
+whose exact short name is `filebrowser-ffmpeg`, deletes
+`/usr/local/filebrowser/bin` (not its parent), and restarts `filebrowserd` if it
+is running so it stops advertising transcoding. The file browser keeps working;
+only the media endpoints go back to `UNAVAILABLE`.

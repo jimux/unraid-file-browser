@@ -38,7 +38,7 @@ func statusFor(code string) int {
 		return http.StatusGatewayTimeout
 	case types.ErrArchive, types.ErrEncoding:
 		return http.StatusUnprocessableEntity
-	case types.ErrIndexing:
+	case types.ErrIndexing, types.ErrUnavailable:
 		return http.StatusServiceUnavailable
 	default:
 		return http.StatusInternalServerError

@@ -48,7 +48,7 @@ export function buildEntryMenu(e: Entry, a: EntryMenuActions): MenuItem[] {
     items.push({
       id: "play",
       label: "Play in new window",
-      title: "Streams from fs/raw in a standalone player window",
+      title: "Streams in a standalone player window (transcoded if this browser needs it)",
       onSelect: () => openPlayer(e.path, a.playSort),
     });
   } else {

@@ -12,13 +12,20 @@
       bundle as an external module with no inline script of any kind, so
       script-src stays strict — keep it that way.
 
+      media-src needs blob: for transcoded playback: hls.js hands the <video>
+      element a MediaSource through URL.createObjectURL, and the native-HLS
+      path (Safari) is fed a rewritten playlist the same way. Both are
+      same-origin blobs this bundle created itself — no other directive is
+      widened, and script-src in particular stays strict (hls.js is told not to
+      spawn its blob: worker for exactly that reason; see lib/hls.ts).
+
       NOTE: frame-ancestors is deliberately absent — browsers ignore that
       directive when it arrives in a meta element and log a console warning for
       it. The plugin must send it as a real HTTP header instead.
     -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; media-src 'self'; object-src 'none'; base-uri 'none'"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; media-src 'self' blob:; object-src 'none'; base-uri 'none'"
     />
     <!-- Inline so the iframe never requests a /favicon.ico the plugin doesn't ship. -->
     <link

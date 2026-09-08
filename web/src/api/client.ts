@@ -10,6 +10,10 @@ import type {
   IndexStatus,
   ListParams,
   ListResult,
+  MediaCapabilities,
+  MediaProbe,
+  MediaSession,
+  MediaSessionParams,
   SearchParams,
   SearchResult,
   StatResult,
@@ -60,8 +64,18 @@ const STATUS_CODES: Record<number, ApiErrorCode> = {
   504: "TIMEOUT",
 };
 
-function codeForStatus(status: number): ApiErrorCode {
-  return STATUS_CODES[status] ?? "INTERNAL";
+/**
+ * 503 is overloaded: the index endpoints mean "busy" (`INDEXING`) by it and
+ * the media endpoints mean "ffmpeg is not installed" (`UNAVAILABLE`). The
+ * envelope's own `code` always wins — this map is only consulted when the
+ * daemon (or the PHP bridge, or nginx) answered with something that is not a
+ * parseable envelope, so the path is the only signal left to disambiguate.
+ */
+const STATUS_CODES_MEDIA: Record<number, ApiErrorCode> = { ...STATUS_CODES, 503: "UNAVAILABLE" };
+
+function codeForStatus(status: number, path = ""): ApiErrorCode {
+  const map = path.startsWith("/media/") ? STATUS_CODES_MEDIA : STATUS_CODES;
+  return map[status] ?? "INTERNAL";
 }
 
 /** Serialize params, dropping undefined/null/"" so defaults stay server-side. */
@@ -134,7 +148,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     body = text ? JSON.parse(text) : null;
   } catch {
     throw new ApiError(
-      codeForStatus(res.status),
+      codeForStatus(res.status, path),
       res.ok
         ? "malformed response from daemon (not JSON)"
         : `HTTP ${res.status}: ${text.slice(0, 200) || res.statusText}`,
@@ -145,10 +159,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (body && typeof body === "object" && "ok" in body) {
     const env = body as OkEnvelope<T> | ErrEnvelope;
     if (env.ok) return env.data;
-    throw new ApiError(env.error?.code ?? codeForStatus(res.status), env.error?.message ?? "request failed", res.status);
+    throw new ApiError(
+      env.error?.code ?? codeForStatus(res.status, path),
+      env.error?.message ?? "request failed",
+      res.status,
+    );
   }
 
-  throw new ApiError(codeForStatus(res.status), `unexpected response shape (HTTP ${res.status})`, res.status);
+  throw new ApiError(codeForStatus(res.status, path), `unexpected response shape (HTTP ${res.status})`, res.status);
 }
 
 async function post<T>(path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
@@ -198,6 +216,91 @@ export function hex(p: HexParams, signal?: AbortSignal): Promise<HexResult> {
 
 export function encodings(signal?: AbortSignal): Promise<EncodingOption[]> {
   return request<EncodingsResult>("/encodings", { signal }).then((d) => d.encodings ?? []);
+}
+
+/* ------------------------------------------------------- media / transcode */
+
+/**
+ * Capabilities are a property of the *daemon host*, not of the file, and they
+ * cannot change while a player window is open — one request per document.
+ * A failed probe clears the memo so a retry can still succeed.
+ */
+let capsPromise: Promise<MediaCapabilities> | null = null;
+
+export function mediaCapabilities(): Promise<MediaCapabilities> {
+  if (!capsPromise) {
+    capsPromise = request<MediaCapabilities>("/media/capabilities")
+      .then((c) => ({
+        ...c,
+        available: !!c?.available,
+        // Go marshals empty slices as null; never let one reach .map().
+        hwaccels: Array.isArray(c?.hwaccels) ? c.hwaccels : [],
+        encoders: Array.isArray(c?.encoders) ? c.encoders : [],
+      }))
+      .catch((e) => {
+        capsPromise = null;
+        throw e;
+      });
+  }
+  return capsPromise;
+}
+
+export function mediaProbe(path: string, signal?: AbortSignal): Promise<MediaProbe> {
+  return request<{ probe: MediaProbe }>(`/media/probe${qs({ path })}`, { signal }).then((d) => {
+    const p = d.probe ?? ({} as MediaProbe);
+    return {
+      ...p,
+      video: p.video ?? null,
+      audio: Array.isArray(p.audio) ? p.audio : [],
+      subtitles: Array.isArray(p.subtitles) ? p.subtitles : [],
+    };
+  });
+}
+
+export function createMediaSession(p: MediaSessionParams, signal?: AbortSignal): Promise<MediaSession> {
+  return post<{ session: MediaSession }>(
+    "/media/session",
+    { path: p.path, can: p.can, audioIndex: p.audioIndex, maxHeight: p.maxHeight },
+    signal,
+  ).then((d) => d.session);
+}
+
+/** Path (not URL) of the close endpoint — `apiUrl()` it, or beacon it. */
+export function mediaSessionClosePath(id: string): string {
+  return `/media/session/${encodeURIComponent(id)}/close`;
+}
+
+export function closeMediaSession(id: string): Promise<unknown> {
+  return post<unknown>(mediaSessionClosePath(id), {});
+}
+
+/**
+ * Best-effort close for `pagehide`: a beacon survives the document going away,
+ * which a fetch does not. It cannot carry the CSRF header, so the synchronous
+ * close in the unmount path stays the primary mechanism and the daemon's TTL
+ * sweeper is the backstop. Returns whether the beacon was queued.
+ */
+export function beaconCloseMediaSession(id: string): boolean {
+  try {
+    return navigator.sendBeacon?.(apiUrl(mediaSessionClosePath(id)), "") ?? false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The API path of a file inside a session's HLS directory.
+ *
+ * `name` is a *bare* playlist/segment name as it appears in the manifest
+ * (`index.m3u8`, `seg-00001.ts`). Anything with a slash, a scheme or a `..` in
+ * it is not something the daemon serves, so it is refused rather than
+ * concatenated into a URL.
+ */
+const HLS_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+export function hlsPath(sessionId: string, name: string): string | null {
+  if (!sessionId || !HLS_NAME.test(name) || name.includes("..")) return null;
+  return `/media/hls/${encodeURIComponent(sessionId)}/${name}`;
 }
 
 /* ------------------------------------------------------------------ search */

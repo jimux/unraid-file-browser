@@ -1,21 +1,25 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { listDir, rawUrl, stat } from "../api/client";
-import type { Entry, SortDir, SortKey } from "../api/types";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  ApiError,
+  beaconCloseMediaSession,
+  closeMediaSession,
+  createMediaSession,
+  listDir,
+  mediaCapabilities,
+  mediaProbe,
+  rawUrl,
+  stat,
+} from "../api/client";
+import type { Entry, MediaProbe, MediaSession, ProbeAudioStream, SortDir, SortKey } from "../api/types";
 import { ErrorBanner, Spinner } from "../components/Feedback";
 import { Icon } from "../components/Icon";
 import { ContextMenu, useContextMenu, type MenuItem } from "../components/ContextMenu";
 import { useAsync } from "../hooks/useAsync";
 import { copyAndToast, triggerDownload } from "../lib/actions";
+import { browserMediaSupport, useNativeHls } from "../lib/codecs";
 import { formatBytesExact, formatSize } from "../lib/format";
-import {
-  isPlaylistEntry,
-  mediaKind,
-  mediaMimeFor,
-  playability,
-  serverClassificationMessage,
-  serverStreamsInline,
-  type MediaKind,
-} from "../lib/media";
+import { attachHls, type HlsAttachment } from "../lib/hls";
+import { canPlayDirectly, isPlaylistEntry, mediaKind, mediaMimeFor, type MediaKind } from "../lib/media";
 import { basename, isVirtual, parentPath } from "../lib/paths";
 import { navigate, playHref, viewHref } from "../lib/router";
 
@@ -30,6 +34,7 @@ const SEEK_STEP = 10; // seconds, ←/→
 const PLAYLIST_LIMIT = 10000;
 
 const AUTO_ADVANCE_KEY = "fb.player.autoAdvance";
+const MAX_HEIGHT_KEY = "fb.player.maxHeight";
 
 /** Defaults ON; a hostile/absent localStorage must not break the player. */
 function readAutoAdvance(): boolean {
@@ -51,13 +56,97 @@ function writeAutoAdvance(on: boolean): void {
 const NO_SIBLINGS: Entry[] = [];
 
 /**
+ * The quality control. `0` is "Original", which on a file this browser can
+ * decode means the direct `fs/raw` bytes and on one it cannot means "transcode
+ * without capping the height".
+ *
+ * The presets exist for the case the file plays *perfectly well* and is simply
+ * too fat for the link — a 60 Mbps 4K remux over wifi — where trading
+ * resolution for a stream that does not stutter is the whole point.
+ */
+const QUALITY_CAPS: { label: string; value: number }[] = [
+  { label: "Original", value: 0 },
+  { label: "1080p", value: 1080 },
+  { label: "720p", value: 720 },
+  { label: "480p", value: 480 },
+];
+
+/** Remembered across files *and* windows: a laptop on wifi wants 720p always. */
+function readMaxHeight(): number {
+  try {
+    const v = Number(window.localStorage.getItem(MAX_HEIGHT_KEY));
+    return QUALITY_CAPS.some((q) => q.value === v) ? v : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function writeMaxHeight(v: number): void {
+  try {
+    window.localStorage.setItem(MAX_HEIGHT_KEY, String(v));
+  } catch {
+    /* the preference just does not persist */
+  }
+}
+
+/** What the media element is actually reading. */
+type Source = { kind: "direct"; src: string } | { kind: "hls"; session: MediaSession };
+
+/**
+ * Everything the ladder decides for *one file*. Keyed by path rather than
+ * reset in an effect: a ↓ into the next track must not inherit the previous
+ * file's escalation, audio track or resume position, and an effect-based reset
+ * would leave one render — and one session-creating effect pass — running on
+ * the stale values.
+ */
+interface LadderState {
+  forPath: string;
+  /** The direct element failed (or was never possible): use HLS. */
+  escalated: boolean;
+  directFailure: "network" | "unsupported" | null;
+  /** ffprobe stream index; undefined = the daemon's own default track. */
+  audioIndex?: number;
+  /** 0 = Original. */
+  maxHeight: number;
+  streamError: string | null;
+  /** Resume point carried across a source switch. */
+  startAt: number;
+  startPaused: boolean;
+  /** Bumped by "Try again" to force a new session. */
+  retry: number;
+}
+
+function freshLadder(forPath: string): LadderState {
+  return {
+    forPath,
+    escalated: false,
+    directFailure: null,
+    maxHeight: readMaxHeight(),
+    streamError: null,
+    startAt: 0,
+    startPaused: false,
+    retry: 0,
+  };
+}
+
+/**
  * Standalone media player — the whole document, no sidebar/topbar, because it
  * is meant to live in its own popup window
  * (`#/play/<encoded path>?sort=&dir=`).
  *
- * It plays `fs/raw` directly. There is no transcoding anywhere in this stack,
- * so the browser's own decoder is the entire compatibility story; when it
- * cannot decode the file we say so plainly and offer the bytes instead.
+ * ## The playback ladder
+ *
+ *  1. **Direct.** The daemon streams `video/*`/`audio/*` inline with Range
+ *     support, so when this browser can decode the file we point a plain
+ *     `<video>`/`<audio>` at `fs/raw` and no server-side work happens at all.
+ *  2. **HLS.** Otherwise — an AVI, an HEVC mkv, an AC-3 track Chrome refuses,
+ *     a file the daemon will not serve inline, an element that mounted and
+ *     then fired `error`, or a quality cap the user picked by hand — we tell
+ *     the daemon what this browser can decode (`lib/codecs.ts`) and it answers
+ *     with an HLS session: a remux when only the container is wrong, a real
+ *     transcode when a codec (or the requested height) demands one.
+ *  3. **Neither.** ffmpeg missing on the server, or a file with nothing
+ *     decodable in it: say exactly which, and offer the bytes.
  *
  * `sort`/`dir` are the browser view's current ordering, carried in the hash:
  * ↑/↓ (and the ‹ › buttons) walk the media siblings of this file in that same
@@ -123,9 +212,8 @@ export function PlayerView({
 
   /**
    * `ended` → the *immediate* next entry, even one this browser cannot decode:
-   * the user then sees the fallback card and presses ↓ again. Skipping ahead to
-   * the next decodable file would be guesswork (`canPlayType` is only a hint)
-   * and would silently drop files from the queue.
+   * that file gets its own turn up the ladder. Skipping ahead would be
+   * guesswork and would silently drop files from the queue.
    */
   const onEnded = useCallback(() => {
     if (autoAdvance) goTo(next);
@@ -176,16 +264,324 @@ export function PlayerView({
   }, [name]);
 
   const kind = mediaKind(entry?.mime, entry?.name ?? name) ?? (force ? "video" : null);
+  const mime = entry ? mediaMimeFor(entry) : "";
+
+  /* ------------------------------------------------------------- the ladder */
+
+  const [ladderState, setLadderState] = useState<LadderState>(() => freshLadder(path));
+  const ladder = ladderState.forPath === path ? ladderState : freshLadder(path);
+  const patchLadder = useCallback(
+    (p: Partial<LadderState>) =>
+      setLadderState((s) => ({ ...(s.forPath === path ? s : freshLadder(path)), ...p, forPath: path })),
+    [path],
+  );
+
+  /** Rung one: worth pointing an element straight at `fs/raw`? */
+  const playsHere = useMemo(() => canPlayDirectly(entry), [entry]);
+  const directOk = playsHere && !ladder.directFailure;
+  /** The file itself forces HLS — nothing to do with the quality control. */
+  const needsHls = !!entry && !!kind && !directOk;
+  const wantHls = needsHls || (!!entry && !!kind && ladder.maxHeight > 0);
 
   /**
-   * The daemon, not the SPA, decides what `fs/raw` streams: only what *it*
-   * classifies as `video/*` or `audio/*` comes back inline; everything else is
-   * an `application/octet-stream` attachment a media element cannot read
-   * (API.md, "Raw content policy"). So whenever our extension override — or
-   * the user's "Play as media…" — is the only reason we are here, say so
-   * before mounting an element that would just fire `error` seconds later.
+   * Capabilities are fetched for every media file, not just the ones that need
+   * transcoding: the quality presets are always on screen and have to know
+   * whether they can be offered. The client memoises the request, so it is one
+   * small GET per player window.
    */
-  const serverRefuses = !!entry && !serverStreamsInline(entry.mime);
+  const capsState = useAsync(() => mediaCapabilities(), [], !!entry && !!kind);
+  const caps = capsState.data;
+  const capsPending = capsState.loading && !caps && !capsState.error;
+  const transcodeUsable = !!caps?.available;
+  const unavailableReason = capsState.error ? capsState.error.message : caps?.reason || "ffmpeg is not installed";
+
+  const buildSession = wantHls && transcodeUsable;
+
+  /**
+   * The stream list, for the audio-track picker. Pinned to the path for the
+   * same reason `entryState` is, and skipped for archive-internal paths, which
+   * `/media/probe` refuses outright (ffprobe needs a real file).
+   */
+  const probeState = useAsync<{ forPath: string; probe: MediaProbe }>(
+    (signal) => mediaProbe(path, signal).then((p) => ({ forPath: path, probe: p })),
+    [path],
+    buildSession && !isVirtual(path),
+  );
+  const probe = probeState.data?.forPath === path ? probeState.data.probe : null;
+  const audioTracks: ProbeAudioStream[] = probe?.audio ?? [];
+
+  /**
+   * Session state is keyed the same way the ladder is, so a session belonging
+   * to the previous file (or to the previous track/quality choice) can never
+   * be rendered for a beat before the effect replaces it.
+   */
+  const sessionKey = `${path}|${ladder.audioIndex ?? ""}|${ladder.maxHeight}|${ladder.retry}`;
+  const [sessionState, setSessionState] = useState<{
+    key: string;
+    session: MediaSession | null;
+    error: ApiError | Error | null;
+  }>({ key: "", session: null, error: null });
+  const session = sessionState.key === sessionKey ? sessionState.session : null;
+  const sessionError = sessionState.key === sessionKey ? sessionState.error : null;
+
+  /**
+   * Session lifecycle. One session per (file, audio track, quality cap); the
+   * cleanup closes it on unmount, on a ↑/↓ to another file, and on every
+   * switch of those selectors.
+   *
+   * The creation POST is deliberately *not* aborted on cleanup: an aborted
+   * fetch would hide the id of a session the daemon may well have created,
+   * leaking it until the TTL sweeper notices. Letting it land and closing it
+   * immediately is what keeps rapid ↓-stepping from piling up ffmpeg
+   * processes.
+   */
+  useEffect(() => {
+    if (!buildSession) return;
+    let cancelled = false;
+    let created: string | null = null;
+    createMediaSession({
+      path,
+      can: browserMediaSupport().can,
+      audioIndex: ladder.audioIndex,
+      maxHeight: ladder.maxHeight || undefined,
+    })
+      .then((s) => {
+        created = s.id;
+        if (cancelled) {
+          void closeMediaSession(s.id).catch(() => undefined);
+          return;
+        }
+        setSessionState({ key: sessionKey, session: s, error: null });
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) {
+          setSessionState({ key: sessionKey, session: null, error: e instanceof Error ? e : new Error(String(e)) });
+        }
+      });
+    return () => {
+      cancelled = true;
+      if (created) void closeMediaSession(created).catch(() => undefined);
+    };
+    // `sessionKey` is exactly the tuple this effect is keyed on.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [buildSession, sessionKey]);
+
+  /**
+   * Belt and braces for the window simply going away, where React's cleanup
+   * never runs. `sendBeacon` POSTs without the CSRF header the bridge's
+   * auto_prepend wants, so this is best-effort only — the unmount close above
+   * is the real mechanism and the daemon's TTL sweeper is the backstop.
+   */
+  const sessionId = session?.id ?? null;
+  useEffect(() => {
+    if (!sessionId) return;
+    const bye = () => void beaconCloseMediaSession(sessionId);
+    window.addEventListener("pagehide", bye);
+    window.addEventListener("beforeunload", bye);
+    return () => {
+      window.removeEventListener("pagehide", bye);
+      window.removeEventListener("beforeunload", bye);
+    };
+  }, [sessionId]);
+
+  /** Written by the stage; read when a switch remounts it. */
+  const positionRef = useRef({ time: 0, paused: false });
+  const onProgress = useCallback((time: number, paused: boolean) => {
+    positionRef.current = { time, paused };
+  }, []);
+
+  /** Reopen the stream with a different setting, where the user left off. */
+  const reopenWith = useCallback(
+    (p: Partial<LadderState>) => {
+      const { time, paused } = positionRef.current;
+      patchLadder({ startAt: time, startPaused: paused, streamError: null, ...p });
+    },
+    [patchLadder],
+  );
+
+  const onDirectError = useCallback(
+    (reason: "network" | "unsupported") => {
+      // Rung two. Even a network drop is worth retrying as HLS: if the daemon
+      // is alive it answers, and if it is not the session request says so.
+      reopenWith({ directFailure: reason, escalated: true });
+    },
+    [reopenWith],
+  );
+
+  /**
+   * Session first, direct second. Keeping the direct element mounted while a
+   * session is being built is what makes a quality switch seamless — and what
+   * lets a failed switch stay on the stream that is already playing.
+   */
+  const source: Source | null =
+    !entry || !kind
+      ? null
+      : session
+        ? { kind: "hls", session }
+        : directOk
+          ? { kind: "direct", src: rawUrl(path) }
+          : null;
+
+  const switching = buildSession && !session && !sessionError && source?.kind === "direct";
+
+  const badge = switching
+    ? { label: "Switching…", tip: "Asking the server for a transcoded stream" }
+    : source?.kind === "hls"
+      ? {
+          label:
+            source.session.mode === "remux"
+              ? "Remuxing"
+              : `Transcoding${qualitySuffix(ladder.maxHeight, source.session)}`,
+          tip:
+            source.session.reason ||
+            (source.session.mode === "remux" ? "Container rewrapped as HLS" : "Re-encoded for this browser"),
+        }
+      : source
+        ? { label: "Direct", tip: "Playing the original bytes from fs/raw — no server-side work." }
+        : null;
+
+  const unplayableHere = (
+    <>
+      Your browser can’t play <code className="mono">{mime || "this file"}</code> natively — download the file or use an
+      external player.
+    </>
+  );
+
+  const downloadBtn = (
+    <a className="btn btn-primary" href={rawUrl(path, true)} download={name}>
+      Download file
+    </a>
+  );
+
+  /* ------------------------------------------------------------- the stage */
+
+  let stage: ReactNode;
+  if (entryState.error && !entry) {
+    // A stat failure is survivable when the directory listing already handed
+    // us this entry, and the error from the *previous* file must not flash
+    // over the new one.
+    stage = (
+      <div className="player-stage">
+        <div className="player-card">
+          <ErrorBanner error={entryState.error} onRetry={entryState.reload} />
+          {downloadBtn}
+        </div>
+      </div>
+    );
+  } else if (!entry) {
+    stage = (
+      <div className="player-stage">
+        <Spinner label="loading…" />
+      </div>
+    );
+  } else if (!kind) {
+    stage = (
+      <div className="player-stage">
+        <div className="player-card">
+          <div className="player-card-title">Not a media file</div>
+          <p className="muted">{entry.mime || "This file"} is not audio or video, so there is nothing to play here.</p>
+          {downloadBtn}
+        </div>
+      </div>
+    );
+  } else if (needsHls && !transcodeUsable && !capsPending) {
+    // Rung three, case one: the file needs help and the server cannot give it.
+    stage = (
+      <div className="player-stage">
+        <div className="player-card" data-testid="transcode-unavailable">
+          <div className="player-card-title">
+            {ladder.directFailure === "network" ? "The stream stopped" : "Can’t play this format"}
+          </div>
+          <p className="player-card-body">
+            {ladder.directFailure === "network" ? (
+              <>The connection to the daemon dropped while streaming {name}.</>
+            ) : (
+              unplayableHere
+            )}
+          </p>
+          <p className="muted small">Transcoding is unavailable: {unavailableReason}.</p>
+          <div className="player-card-actions">
+            {downloadBtn}
+            <a className="btn" href={viewHref(path, "hex")}>
+              View as hex
+            </a>
+          </div>
+        </div>
+      </div>
+    );
+  } else if (sessionError && !source) {
+    // Rung three, case two: ffmpeg is there but this file defeated it.
+    stage = (
+      <div className="player-stage">
+        <div className="player-card" data-testid="session-error">
+          <div className="player-card-title">Can’t play this format</div>
+          <p className="player-card-body">{unplayableHere}</p>
+          <p className="muted small">The server could not transcode it either: {errorText(sessionError)}</p>
+          <div className="player-card-actions">
+            {downloadBtn}
+            <button type="button" className="btn" onClick={() => patchLadder({ retry: ladder.retry + 1 })}>
+              Try again
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  } else if (ladder.streamError) {
+    stage = (
+      <div className="player-stage">
+        <div className="player-card" data-testid="stream-error">
+          <div className="player-card-title">The stream stopped</div>
+          <p className="player-card-body">{ladder.streamError}</p>
+          <div className="player-card-actions">
+            {downloadBtn}
+            <button
+              type="button"
+              className="btn"
+              onClick={() => reopenWith({ streamError: null, retry: ladder.retry + 1 })}
+            >
+              Try again
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  } else if (!source) {
+    stage = (
+      <div className="player-stage">
+        <div className="player-card" data-testid="player-preparing">
+          <Spinner label={capsPending ? "checking transcoder…" : "Preparing stream…"} />
+          <p className="muted small">
+            {ladder.directFailure
+              ? "This browser could not decode the original, so the server is repackaging it."
+              : "The server is repackaging this file into a stream your browser can play."}
+          </p>
+        </div>
+      </div>
+    );
+  } else {
+    stage = (
+      // Keyed on the path *and* the source: a ↑/↓ swap, and every session
+      // switch, get a fresh element with the spinner, failure and
+      // autoplay-blocked state reset — which is exactly what they need.
+      <MediaStage
+        key={`${path}|${source.kind === "hls" ? source.session.id : "direct"}`}
+        path={path}
+        name={name}
+        kind={kind}
+        source={source}
+        startAt={ladder.startAt}
+        startPaused={ladder.startPaused}
+        onPrev={prev ? () => goTo(prev) : null}
+        onNext={next ? () => goTo(next) : null}
+        canClose={canClose}
+        onEnded={onEnded}
+        onProgress={onProgress}
+        onDirectError={onDirectError}
+        onStreamError={(m) => patchLadder({ streamError: m })}
+        hasPlaylist={playlist.length > 1}
+      />
+    );
+  }
 
   return (
     <div className={`player${kind === "video" ? " is-video" : ""}`}>
@@ -198,7 +594,67 @@ export function PlayerView({
               {formatSize(entry.size)} · {entry.mime || "unknown type"}
             </span>
           ) : null}
+          {badge ? (
+            <span className="player-badge" data-mode={badge.label.split(" ")[0]} title={badge.tip} data-testid="player-badge">
+              {badge.label}
+            </span>
+          ) : null}
         </div>
+
+        {/* The track picker only exists once a session does: it is one of the
+            two knobs that session was built with. */}
+        {session && audioTracks.length > 1 ? (
+          <label className="player-select" title="Audio track — switching reopens the stream at the same position">
+            <span className="player-select-label">Audio</span>
+            <select
+              value={ladder.audioIndex ?? defaultTrackIndex(audioTracks)}
+              onChange={(e) => reopenWith({ audioIndex: Number(e.target.value) })}
+              data-testid="player-audio-track"
+            >
+              {audioTracks.map((t) => (
+                <option key={t.index} value={t.index}>
+                  {audioTrackLabel(t)}
+                </option>
+              ))}
+            </select>
+          </label>
+        ) : null}
+
+        {/* Always on screen: "this plays, but not smoothly" is exactly the case
+            the presets exist for, and it is invisible from here. */}
+        {entry && kind ? (
+          <label
+            className="player-select"
+            title={
+              transcodeUsable || capsPending
+                ? "Cap the height the server streams — lower is smaller on the wire"
+                : `Transcoding is unavailable: ${unavailableReason}`
+            }
+          >
+            <span className="player-select-label">Quality</span>
+            <select
+              value={ladder.maxHeight}
+              onChange={(e) => {
+                const v = Number(e.target.value);
+                writeMaxHeight(v);
+                reopenWith({ maxHeight: v });
+              }}
+              data-testid="player-quality"
+            >
+              {QUALITY_CAPS.map((q) => (
+                <option
+                  key={q.value}
+                  value={q.value}
+                  // Original always works; the presets need a transcoder.
+                  disabled={q.value > 0 && !transcodeUsable && !capsPending}
+                >
+                  {q.label}
+                </option>
+              ))}
+            </select>
+          </label>
+        ) : null}
+
         <div className="player-nav">
           <button
             type="button"
@@ -249,73 +705,50 @@ export function PlayerView({
         ) : null}
       </header>
 
-      {/* Only when we have nothing to play: a stat failure is survivable when
-          the directory listing already handed us this entry, and the error
-          from the *previous* file must not flash over the new one. */}
-      {entryState.error && !entry ? (
-        <div className="player-stage">
-          <div className="player-card">
-            <ErrorBanner error={entryState.error} onRetry={entryState.reload} />
-            <a className="btn btn-primary" href={rawUrl(path, true)} download={name}>
-              Download file
-            </a>
-          </div>
+      {/* A switch that failed with something still playing: say so, keep
+          playing, and offer the one-click way back. */}
+      {sessionError && source ? (
+        <div className="player-banner" role="alert" data-testid="switch-error">
+          <Icon name="warn" />
+          <span>Could not switch stream: {errorText(sessionError)}</span>
+          {ladder.maxHeight > 0 ? (
+            <button
+              type="button"
+              className="btn btn-sm"
+              onClick={() => {
+                writeMaxHeight(0);
+                reopenWith({ maxHeight: 0 });
+              }}
+            >
+              Back to Original
+            </button>
+          ) : null}
         </div>
-      ) : !entry ? (
-        <div className="player-stage">
-          <Spinner label="loading…" />
-        </div>
-      ) : !kind ? (
-        <div className="player-stage">
-          <div className="player-card">
-            <div className="player-card-title">Not a media file</div>
-            <p className="muted">
-              {entry.mime || "This file"} is not audio or video, so there is nothing to play here.
-            </p>
-            <a className="btn btn-primary" href={rawUrl(path, true)} download={name}>
-              Download file
-            </a>
-          </div>
-        </div>
-      ) : serverRefuses ? (
-        <div className="player-stage">
-          <div className="player-card" data-testid="server-classification">
-            <div className="player-card-title">The server won’t stream this file</div>
-            <p className="player-card-body">{serverClassificationMessage(name, entry.mime)}</p>
-            <p className="muted small">
-              <code className="mono">fs/raw</code> serves only what the daemon itself classifies as{" "}
-              <code className="mono">video/*</code> or <code className="mono">audio/*</code> inline; anything else
-              arrives as an attachment, which no media element can play.
-            </p>
-            <div className="player-card-actions">
-              <a className="btn btn-primary" href={rawUrl(path, true)} download={name}>
-                Download file
-              </a>
-              <a className="btn" href={viewHref(path, "hex")}>
-                View as hex
-              </a>
-            </div>
-          </div>
-        </div>
-      ) : (
-        // Keyed on the path: a ↑/↓ swap gets a fresh element with the spinner,
-        // failure and autoplay-blocked state reset, which is exactly what a new
-        // file needs.
-        <MediaStage
-          key={path}
-          path={path}
-          name={name}
-          mime={mediaMimeFor(entry)}
-          kind={kind}
-          onPrev={prev ? () => goTo(prev) : null}
-          onNext={next ? () => goTo(next) : null}
-          canClose={canClose}
-          onEnded={onEnded}
-          hasPlaylist={playlist.length > 1}
-        />
-      )}
+      ) : null}
+
+      {stage}
     </div>
   );
+}
+
+function errorText(e: ApiError | Error): string {
+  return e instanceof ApiError ? `${e.code}: ${e.message}` : e.message;
+}
+
+/** " 720p" when a cap is in force, otherwise the height the daemon chose. */
+function qualitySuffix(maxHeight: number, session: MediaSession): string {
+  const h = maxHeight || session.video?.height || 0;
+  return h > 0 ? ` ${h}p` : "";
+}
+
+/** ffprobe's stream index of the track the daemon would pick unprompted. */
+function defaultTrackIndex(tracks: ProbeAudioStream[]): number {
+  return (tracks.find((t) => t.default) ?? tracks[0])?.index ?? 0;
+}
+
+function audioTrackLabel(t: ProbeAudioStream): string {
+  const bits = [t.lang || "und", t.title, t.codec, t.channels ? `${t.channels}ch` : ""].filter(Boolean);
+  return bits.join(" · ");
 }
 
 /* -------------------------------------------------------------------- stage */
@@ -323,20 +756,34 @@ export function PlayerView({
 function MediaStage({
   path,
   name,
-  mime,
   kind,
+  source,
+  startAt,
+  startPaused,
   canClose,
   onEnded,
+  onProgress,
+  onDirectError,
+  onStreamError,
   onPrev,
   onNext,
   hasPlaylist,
 }: {
   path: string;
   name: string;
-  mime: string;
   kind: MediaKind;
+  source: Source;
+  /** Seconds to resume at after a switch; 0 = from the start. */
+  startAt: number;
+  /** The user had it paused when they switched — do not start it playing. */
+  startPaused: boolean;
   canClose: boolean;
   onEnded: () => void;
+  onProgress: (seconds: number, paused: boolean) => void;
+  /** The direct `fs/raw` element failed — the ladder escalates to HLS. */
+  onDirectError: (reason: "network" | "unsupported") => void;
+  /** An HLS stream failed fatally, after hls.js exhausted its own recovery. */
+  onStreamError: (message: string) => void;
   /** null at the ends of the playlist — the menu item is then omitted. */
   onPrev: (() => void) | null;
   onNext: (() => void) | null;
@@ -350,28 +797,95 @@ function MediaStage({
   // ever read at right-click time, is not a trade worth making).
   const { menu, openAt, close: closeMenu } = useContextMenu<boolean>();
 
-  const verdict = useMemo(() => playability(kind, mime), [kind, mime]);
-  // "no" refuses up front; mkv/mov answer "" but often play, so those attempt
-  // and only fall back once the element actually errors.
-  const [failure, setFailure] = useState<string | null>(verdict === "no" ? "unsupported" : null);
   const [ready, setReady] = useState(false);
   const [autoplayBlocked, setAutoplayBlocked] = useState(false);
 
-  const src = useMemo(() => rawUrl(path), [path]);
-  // Archive-internal entries stream without Range, so the browser cannot seek.
-  const seekable = !isVirtual(path);
+  // Archive-internal entries stream without Range, so the browser cannot seek
+  // the *direct* path. An HLS session is segment-addressed, so it always can.
+  const seekable = source.kind === "hls" || !isVirtual(path);
+
+  /**
+   * Which code owns a media-element `error`. hls.js reports its own failures
+   * (and recovers from most of them), so an element error under it must not be
+   * double-handled; the native-HLS transport has no such owner.
+   */
+  const transportRef = useRef<"direct" | "native" | "hls.js">("direct");
+  const cbRef = useRef({ onDirectError, onStreamError });
+  cbRef.current = { onDirectError, onStreamError };
+
+  useEffect(() => {
+    if (source.kind !== "hls") return;
+    const el = ref.current;
+    if (!el) return;
+    let dead = false;
+    let attachment: HlsAttachment | null = null;
+    const ac = new AbortController();
+    attachHls(
+      el,
+      { session: source.session, startAt, signal: ac.signal, onFatal: (m) => cbRef.current.onStreamError(m) },
+      useNativeHls(),
+    )
+      .then((a) => {
+        if (dead) {
+          a.destroy();
+          return;
+        }
+        attachment = a;
+        transportRef.current = a.transport;
+      })
+      .catch((e: unknown) => {
+        if (dead || (e instanceof DOMException && e.name === "AbortError")) return;
+        cbRef.current.onStreamError(e instanceof Error ? e.message : String(e));
+      });
+    return () => {
+      dead = true;
+      ac.abort();
+      attachment?.destroy();
+    };
+    // `source` is stable for the life of this component (the key changes when
+    // the session does) and `startAt` is read once, at attach time.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /**
+   * Resume where the previous source left off. hls.js is told through its
+   * `startPosition`; a native or direct element has to be seeked once its
+   * metadata is in.
+   */
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || startAt <= 0) return;
+    const apply = () => {
+      try {
+        if (Math.abs(el.currentTime - startAt) > 0.5) el.currentTime = startAt;
+      } catch {
+        /* not seekable yet; the next loadedmetadata will try again */
+      }
+    };
+    if (el.readyState >= 1) apply();
+    el.addEventListener("loadedmetadata", apply);
+    return () => el.removeEventListener("loadedmetadata", apply);
+  }, [startAt]);
 
   const onError = useCallback(() => {
     const err = ref.current?.error;
-    setFailure(err && err.code === MediaError.MEDIA_ERR_NETWORK ? "network" : "unsupported");
-  }, []);
+    const reason = err && err.code === MediaError.MEDIA_ERR_NETWORK ? "network" : "unsupported";
+    if (source.kind === "direct") cbRef.current.onDirectError(reason);
+    else if (transportRef.current === "native")
+      cbRef.current.onStreamError(
+        reason === "network"
+          ? `The connection dropped while streaming ${name}.`
+          : `The transcoded stream could not be decoded (${err?.message || "no detail"}).`,
+      );
+    // hls.js owns its own errors and gets to try recovering first.
+  }, [name, source.kind]);
 
   // Autoplay: the popup itself was opened by a click, but that user activation
   // does not carry into the new document, so an audible autoplay may still be
   // refused. Say so rather than looking broken.
   useEffect(() => {
     const el = ref.current;
-    if (!el || failure) return;
+    if (!el || startPaused) return;
     const p = el.play();
     if (p && typeof p.catch === "function") {
       p.then(
@@ -381,7 +895,9 @@ function MediaStage({
         },
       );
     }
-  }, [src, failure]);
+    // Mount only: a re-run would fight the user's own pause.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const toggleFullscreen = useCallback(() => {
     const target = kind === "video" ? (stageRef.current ?? ref.current) : stageRef.current;
@@ -460,55 +976,34 @@ function MediaStage({
     return () => window.removeEventListener("keydown", onKey);
   }, [canClose, path, togglePlay, toggleFullscreen]);
 
-  if (failure) {
-    return (
-      <div className="player-stage" ref={stageRef}>
-        <div className="player-card">
-          <div className="player-card-title">
-            {failure === "network" ? "The stream stopped" : "Can’t play this format"}
-          </div>
-          <p className="player-card-body">
-            {failure === "network" ? (
-              <>The connection to the daemon dropped while streaming {name}.</>
-            ) : (
-              <>
-                Your browser can’t play <code className="mono">{mime || "this file"}</code> natively — download the file
-                or use an external player.
-              </>
-            )}
-          </p>
-          <p className="muted small">
-            There is no server-side transcoding: the daemon streams the original bytes untouched.
-          </p>
-          <div className="player-card-actions">
-            <a className="btn btn-primary" href={rawUrl(path, true)} download={name}>
-              Download file
-            </a>
-            {failure === "network" ? (
-              <button type="button" className="btn" onClick={() => setFailure(null)}>
-                Try again
-              </button>
-            ) : null}
-          </div>
-        </div>
-      </div>
-    );
-  }
+  const report = () => onProgress(ref.current?.currentTime ?? 0, ref.current?.paused ?? false);
 
   const common = {
     ref,
-    src,
+    // HLS sources are fed by hls.js (MediaSource) or by a rewritten playlist
+    // blob — either way the element must not be given a `src` here.
+    src: source.kind === "direct" ? source.src : undefined,
     controls: true,
-    autoPlay: true,
+    autoPlay: !startPaused,
+    /*
+     * "Buffer as far ahead as you can": on the direct path this is the only
+     * knob there is, and it tells the browser to keep fetching while paused.
+     * The HLS path gets the same policy through hls.js's buffer config
+     * (lib/hls.ts) — the ceiling in both cases is the browser's, not ours.
+     */
     preload: "auto" as const,
     onCanPlay: () => setReady(true),
     onPlaying: () => {
       setReady(true);
       setAutoplayBlocked(false);
     },
+    onTimeUpdate: report,
+    onPause: report,
+    onPlay: report,
     onError,
     onEnded,
     "data-testid": "player-media",
+    "data-transport": source.kind,
   };
 
   return (

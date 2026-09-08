@@ -69,13 +69,16 @@ type IndexService interface {
 	Resume()
 }
 
-// Deps are the subsystems the router serves. Archive and Index may be nil: the
-// daemon must still browse and stream files when the index database is
-// unavailable (array not started), and index endpoints then answer INDEXING.
+// Deps are the subsystems the router serves. Archive, Index and Media may be
+// nil: the daemon must still browse and stream files when the index database
+// is unavailable (array not started) or ffmpeg is absent; index endpoints then
+// answer INDEXING and media endpoints UNAVAILABLE.
 type Deps struct {
 	FS      FileSystem
 	Archive ArchiveFS
 	Index   IndexService
+	// Media is the HLS transcoder; nil when ffmpeg is not wired in.
+	Media MediaService
 	// Roots are the boot-time browse roots (-roots); reported by /healthz so
 	// the SPA and the plugin can show what the daemon will let them reach.
 	Roots   []string
@@ -139,6 +142,12 @@ func newRouter(s *server) http.Handler {
 		{http.MethodPost, base + "/index/pause", s.wrap(s.indexPause)},
 		{http.MethodPost, base + "/index/resume", s.wrap(s.indexResume)},
 		{http.MethodGet, base + "/healthz", s.wrap(s.healthz)},
+		{http.MethodGet, base + "/media/capabilities", s.wrap(s.mediaCapabilities)},
+		{http.MethodGet, base + "/media/probe", s.wrap(s.mediaProbe)},
+		{http.MethodPost, base + "/media/session", s.wrap(s.mediaCreateSession)},
+		{http.MethodPost, base + "/media/session/{id}/close", s.wrap(s.mediaCloseSession)},
+		{http.MethodGet, base + "/media/hls/{id}/index.m3u8", s.mediaPlaylist},
+		{http.MethodGet, base + "/media/hls/{id}/{seg}", s.mediaSegment},
 	}
 
 	mux := http.NewServeMux()

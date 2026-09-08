@@ -106,7 +106,11 @@ const (
 	ErrArchive    = "ARCHIVE_ERROR"  // 422
 	ErrEncoding   = "ENCODING_ERROR" // 422
 	ErrIndexing   = "INDEXING"       // 503
-	ErrInternal   = "INTERNAL"       // 500
+	// ErrUnavailable marks an optional subsystem that is not present on this
+	// host (media transcoding without ffmpeg). 503, like INDEXING, but the
+	// client should not retry: the situation is static until reinstall.
+	ErrUnavailable = "UNAVAILABLE" // 503
+	ErrInternal    = "INTERNAL"    // 500
 )
 
 // APIError is an error carrying an API error code; the api package renders it

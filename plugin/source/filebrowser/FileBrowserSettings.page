@@ -64,6 +64,40 @@ function fbDown(data) {
   $('#fb-index').text('-');
 }
 
+// Transcoding depends on the separate "File Browser ffmpeg" companion plugin
+// (filebrowser-ffmpeg), which installs ffmpeg/ffprobe into
+// /usr/local/filebrowser/bin. The daemon probes for them when it starts, so
+// this reports what the daemon actually found, not what is on disk right now.
+function fbCaps() {
+  var url = '/plugins/filebrowser/proxy.php?p=' + encodeURIComponent('/api/v1/media/capabilities');
+  $.ajax({url:url, dataType:'json', cache:false})
+   .done(function(data){
+      var caps = (data && data.ok && data.data) ? data.data : null;
+      if (caps && caps.available) {
+        // Static markup with .html(); daemon-supplied strings with .text().
+        $('#fb-transcode').html("<span class='green-text'><i class='fa fa-circle'></i> _(Available)_</span> &mdash; ffmpeg <span id='fb-ffmpeg-ver'></span> (<span id='fb-ffmpeg-path'></span>)");
+        $('#fb-ffmpeg-ver').text(caps.ffmpeg || '?');
+        $('#fb-ffmpeg-path').text(caps.ffmpegPath || '?');
+        $('#fb-ffmpeg-hint').hide();
+      } else {
+        fbNoCaps(caps && caps.reason ? caps.reason : null);
+      }
+   })
+   .fail(function(xhr){
+      var data = null;
+      try { data = JSON.parse(xhr.responseText); } catch(e) {}
+      fbNoCaps(data && data.error && data.error.message ? data.error.message : null);
+   });
+}
+
+function fbNoCaps(reason) {
+  $('#fb-transcode').html("<span class='red-text'><i class='fa fa-circle'></i> _(Not installed)_</span><span id='fb-caps-why'></span>");
+  // reason comes from the daemon (or proxy.php's error envelope): untrusted
+  // markup, so it is inserted as text.
+  if (reason) $('#fb-caps-why').text(' (' + reason + ')');
+  $('#fb-ffmpeg-hint').show();
+}
+
 function fbUptime(sec) {
   sec = parseInt(sec, 10);
   if (!sec || sec < 0) return '-';
@@ -85,6 +119,7 @@ function fbAction(action) {
       $('#fb-output').text(out || '_(Done)_');
       $('#fb-pid').text((data && data.data && data.data.pid) ? data.data.pid : '-');
       fbHealth();
+      fbCaps();
    }, 'json')
    .fail(function(){
       $('#fb-buttons button').prop('disabled', false);
@@ -94,13 +129,16 @@ function fbAction(action) {
 
 $(function(){
   fbHealth();
-  setInterval(fbHealth, 10000);
+  fbCaps();
+  setInterval(function(){ fbHealth(); fbCaps(); }, 10000);
 });
 </script>
 <style>
 #fb-output { display:none; white-space:pre-wrap; font-family:bitstream,monospace; font-size:1.1rem; margin-top:10px; }
 #fb-buttons button { margin-right:8px; }
 table.fb-status td:first-child { width:22rem; }
+#fb-ffmpeg-hint { display:none; margin-top:4px; font-size:1.1rem; opacity:0.85; }
+#fb-ffmpeg-hint code { user-select:all; -webkit-user-select:all; word-break:break-all; }
 </style>
 
 <table class="tablesorter fb-status">
@@ -113,6 +151,13 @@ table.fb-status td:first-child { width:22rem; }
 <tr><td>_(Process id)_</td><td id="fb-pid"><?=$fb_running ? $fb_pid : '-'?></td></tr>
 <tr><td>_(Socket)_</td><td><?=htmlspecialchars(FB_SOCKET)?> &mdash; <?=$fb_socket ? _('present') : _('absent')?></td></tr>
 <tr><td>_(Log)_</td><td><?=htmlspecialchars(FB_LOGFILE)?></td></tr>
+<tr><td>_(Transcoding)_</td><td>
+  <span id="fb-transcode">_(checking)_ ...</span>
+  <div id="fb-ffmpeg-hint">
+    <?=_('Install the File Browser ffmpeg plugin from Plugins &gt; Install Plugin using this URL')?>:<br>
+    <code>https://github.com/jimux/unraid-file-browser/releases/latest/download/filebrowser-ffmpeg.plg</code>
+  </div>
+</td></tr>
 </tbody>
 </table>
 

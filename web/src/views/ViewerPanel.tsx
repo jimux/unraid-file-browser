@@ -349,7 +349,7 @@ function MediaTab({ path, entry }: { path: string; entry: Entry | null }) {
           type="button"
           className="btn btn-primary btn-play"
           onClick={() => openPlayer(path)}
-          title="Opens a separate window streaming from fs/raw"
+          title="Opens a separate window; streams from fs/raw, or transcoded HLS when the browser needs it"
         >
           <span className="play-glyph" aria-hidden="true">
             ▶
@@ -363,11 +363,14 @@ function MediaTab({ path, entry }: { path: string; entry: Entry | null }) {
 
       <div className="muted small media-note">
         {serverRefuses ? (
-          <span className="media-note-warn">{serverClassificationMessage(name, reported)}</span>
+          <span className="media-note-warn">
+            {serverClassificationMessage(name, reported)} The player window can still stream it: it asks the daemon for
+            an HLS session, which reads the file directly and is not bound by the raw-content policy.
+          </span>
         ) : unsupported ? (
           <>
-            Your browser can’t play <code className="mono">{mime || "this type"}</code> natively — download the file or
-            use an external player. There is no server-side transcoding.
+            Your browser can’t play <code className="mono">{mime || "this type"}</code> natively, so the player window
+            will ask the server to remux or transcode it (if ffmpeg is installed there). No preview here.
           </>
         ) : isVirtual(path) ? (
           <>Streams from inside the archive: playback works, but seeking does not (no Range support on virtual paths).</>

@@ -26,6 +26,13 @@
 <CHANGES>
 ##File Browser
 
+###2026.09.08
+- Transcoding: files the browser cannot play natively are remuxed or transcoded on the fly and streamed as HLS, with a quality selector in the player and "Play" on the right-click menu
+- ffmpeg is NOT in this package. It ships as a separate companion plugin, "File Browser ffmpeg" (filebrowser-ffmpeg), installed from https://github.com/jimux/unraid-file-browser/releases/latest/download/filebrowser-ffmpeg.plg
+- Why: the plugin manager rewrites the whole package to the USB boot flash on every update, so bundling 190 MB of ffmpeg would have meant 190 MB of flash writes for every 5 MB file-browser release. The companion is versioned by ffmpeg's own version and is only rewritten when ffmpeg changes
+- Either plugin may be installed first; Settings > File Browser Settings shows whether transcoding is available and how to add it
+- Everything else still works without the companion plugin: browsing, search, viewing, downloads and native playback are unaffected
+
 ###2026.09.07d
 - Fix: updates were recorded as installed without actually installing (Unraid's upgradepkg skipped the package as "not newer"); the installer now replaces the package explicitly and verifies the installed version
 - Fix: Settings crashed with "Cannot read properties of null (reading 'map')" when the index config had never been saved (unset lists were serialised as null)
@@ -63,6 +70,13 @@ Layout installed by the package (see plugin/README.md for the full contract):
   /usr/local/sbin/filebrowserd                 daemon binary (unix socket only)
   /usr/local/sbin/7zz                          bundled static 7-Zip, used by the archive reader
   /boot/config/plugins/filebrowser/            persistent settings (settings.cfg) - survives upgrades
+
+ffmpeg is deliberately NOT in this package: it is the separate
+filebrowser-ffmpeg companion plugin, which installs ffmpeg and ffprobe into
+/usr/local/filebrowser/bin. Keeping the 190 MB of binaries out of this package
+keeps a file-browser update to ~5 MB of USB flash writes instead of ~190 MB.
+The daemon looks for them in /usr/local/filebrowser/bin, then /usr/local/sbin,
+then $PATH, and reports transcoding as unavailable when none is found.
 
 The 'version' and 'md5' entity declarations above are rewritten in place by
 `make package` (see the Makefile) with a literal sed pattern, so those two

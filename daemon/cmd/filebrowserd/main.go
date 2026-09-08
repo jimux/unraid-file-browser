@@ -21,6 +21,7 @@ import (
 	"unraid-filebrowser/internal/config"
 	"unraid-filebrowser/internal/fsops"
 	"unraid-filebrowser/internal/index"
+	"unraid-filebrowser/internal/transcode"
 	"unraid-filebrowser/internal/types"
 )
 
@@ -130,9 +131,20 @@ func run(dev bool, listen, socket, dataDir, rootList string, rootOverride bool) 
 	}
 	resolver := archive.New(fs, archive.Options{TempDir: tempDir})
 
+	// Transcoding is optional: New() discovers ffmpeg/ffprobe and never fails,
+	// reporting unavailability through the media endpoints instead.
+	media := transcode.New(fs, transcode.Options{})
+	defer media.Close()
+	if caps := media.Capabilities(); caps.Available {
+		log.Printf("media: ffmpeg %s, hwaccels %v", caps.FFmpeg, caps.HWAccels)
+	} else {
+		log.Printf("media: transcoding unavailable (%s)", caps.Reason)
+	}
+
 	deps := api.Deps{
 		FS:      fs,
 		Archive: resolver,
+		Media:   media,
 		Roots:   browseRoots,
 		Version: version,
 		DevMode: dev,

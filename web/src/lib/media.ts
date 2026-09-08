@@ -4,10 +4,16 @@
  * `fs/raw` serves everything under `audio/*` and `video/*` **inline** with its
  * real Content-Type, `Accept-Ranges: bytes` and Range support for real files
  * (archive-internal virtual paths stream without Range — playback works, but
- * seeking does not). That is the whole reason a media file can be played
- * straight from the daemon with a plain <video>/<audio> element: there is no
- * transcoder anywhere in this stack, so whatever the browser cannot decode
- * natively cannot be played at all — only downloaded.
+ * seeking does not). That is why a media file the browser understands can be
+ * played straight from the daemon with a plain <video>/<audio> element, with
+ * no server-side work at all.
+ *
+ * Everything else now goes up a ladder rather than into a dead end: the player
+ * asks the daemon for an HLS session (`POST /media/session`, see PlayerView),
+ * which remuxes when only the container is wrong and transcodes when a codec
+ * is. The "download it instead" cards in this stack are therefore reserved for
+ * the cases transcoding genuinely cannot rescue — ffmpeg missing on the
+ * server, or a file with no decodable stream in it.
  *
  * Detection is *two* rules, in this order:
  *
@@ -24,9 +30,10 @@
  * The catch is that the *server* still decides what `fs/raw` streams: only
  * what it classifies as `video/*` or `audio/*` is served inline. Anything else
  * arrives as an `application/octet-stream` attachment that a <video> element
- * cannot play. So whenever rule 2 is the only reason we call a file media, the
- * player must say so up front instead of mounting an element that will fail —
- * see `serverStreamsInline()` and `serverClassificationMessage()`.
+ * cannot play. That no longer blocks playback — `/media/session` reads the
+ * file from disk itself and is unaffected by the raw-content policy — but it
+ * does mean the direct path is off the table, so such a file skips straight to
+ * HLS. See `canPlayDirectly()`.
  */
 
 import type { Entry } from "../api/types";
@@ -200,8 +207,8 @@ export function mediaMimeFor(entry: { name: string; mime?: string | null }): str
 
 /**
  * True when the *daemon* will stream this file inline, which is the only way a
- * media element can ever read it: `fs/raw` serves `video/*` and `audio/*` with
- * their real Content-Type and hands everything else back as an
+ * media element can read `fs/raw` at all: it serves `video/*` and `audio/*`
+ * with their real Content-Type and hands everything else back as an
  * `application/octet-stream` attachment (API.md, "Raw content policy").
  *
  * This is deliberately keyed on the mime the server *reported*, not on our
@@ -279,6 +286,23 @@ export function playability(kind: MediaKind, mime: string | undefined | null): P
   if (answer === "probably") return "probably";
   if (answer === "maybe") return "maybe";
   return ATTEMPT_ANYWAY.has(t) ? "attempt" : "no";
+}
+
+/**
+ * Rung one of the playback ladder: is it worth pointing a media element
+ * straight at `fs/raw`?
+ *
+ * Both halves have to hold — the daemon has to be willing to stream the bytes
+ * inline, *and* the engine has to have some chance of decoding them. A "no"
+ * here is not a refusal to play the file; it means "go build an HLS session",
+ * which is also where an element that mounts and then fires `error` ends up.
+ */
+export function canPlayDirectly(entry: { name: string; mime?: string | null } | null): boolean {
+  if (!entry) return false;
+  if (!serverStreamsInline(entry.mime)) return false;
+  const kind = mediaKind(entry.mime, entry.name);
+  if (!kind) return false;
+  return playability(kind, mediaMimeFor(entry)) !== "no";
 }
 
 /**
