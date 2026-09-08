@@ -120,6 +120,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     ...((init?.headers as Record<string, string>) ?? {}),
   };
   let method = init?.method ?? "GET";
+  let reqBody = init?.body;
   if (method !== "GET" && !import.meta.env.DEV) {
     const token = csrfToken();
     if (token) headers["X-CSRF-TOKEN"] = token;
@@ -129,6 +130,18 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       headers["X-HTTP-Method-Override"] = method;
       method = "POST";
     }
+    // Unraid's auto_prepend guards every POST, and on 7.2.0 and earlier it
+    // reads the token ONLY from $_POST -- a JSON body leaves $_POST empty, so
+    // it rejected us and (on those versions) exited without writing anything,
+    // surfacing as an inexplicable "HTTP 200, empty body". Wrapping the JSON in
+    // a form field puts the token where every version looks; proxy.php unwraps
+    // `payload` and forwards clean JSON to the daemon. The X-CSRF-TOKEN header
+    // above still covers newer Unraid, which accepts it.
+    const form = new URLSearchParams();
+    if (token) form.set("csrf_token", token);
+    form.set("payload", typeof reqBody === "string" ? reqBody : "{}");
+    reqBody = form.toString();
+    headers["Content-Type"] = "application/x-www-form-urlencoded;charset=UTF-8";
   }
   try {
     res = await fetch(apiUrl(path), {
@@ -136,6 +149,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       ...init,
       method,
       headers,
+      body: reqBody,
     });
   } catch (e) {
     if (e instanceof DOMException && e.name === "AbortError") throw e;

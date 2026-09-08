@@ -26,6 +26,13 @@
 <CHANGES>
 ##File Browser
 
+###2026.09.08b
+- Fix: transcoding, Settings save and Rescan silently failed on Unraid 7.2.0 and earlier. The webGUI's CSRF check reads the token only from form fields, so our JSON POSTs were rejected before the plugin ran, by an exit() that emits no body -- which arrives as an empty HTTP 200 and surfaced as "unexpected response shape". Requests now carry the token in a form envelope that every Unraid version accepts
+- Fix: the bridge never emits a 2xx whose body is not what the daemon sent; a truncated or unlabelable response is reported as an error envelope instead
+- Fix: video fits the window. Portrait clips opened zoomed in with the control bar below the fold; the control bar now sits at the bottom of the window for any aspect ratio
+- Chrome's control-bar gradient is toned down
+- Fix: a response the daemon could not encode returned an empty HTTP 200 with nothing logged; it is now a logged error
+
 ###2026.09.08
 - Transcoding: files the browser cannot play natively are remuxed or transcoded on the fly and streamed as HLS, with a quality selector in the player and "Play" on the right-click menu
 - ffmpeg is NOT in this package. It ships as a separate companion plugin, "File Browser ffmpeg" (filebrowser-ffmpeg), installed from https://github.com/jimux/unraid-file-browser/releases/latest/download/filebrowser-ffmpeg.plg

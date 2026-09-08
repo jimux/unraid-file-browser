@@ -32,11 +32,24 @@
  *   - only GET and POST are accepted. POST may carry X-HTTP-Method-Override:
  *     PUT and nothing else; the override is validated *before* we open the
  *     socket, so a rejected request never touches the daemon.
- *   - a POST body must be application/json. The SPA sends nothing else, and
- *     refusing form/multipart bodies keeps this endpoint off the list of
- *     things a cross-origin <form> could ever post to.
+ *   - a POST body is either application/json (the body IS the upstream body) or
+ *     the application/x-www-form-urlencoded envelope described under CSRF
+ *     below, whose `payload` field carries the JSON. Nothing else - in
+ *     particular no multipart, so this endpoint can never be a file drop.
+ *     The envelope's only two recognised fields are csrf_token and payload;
+ *     any other field is a 400.
  *   - the webGUI csrf_token is verified here as well, independently of
- *     Unraid's auto_prepend (see CSRF below).
+ *     Unraid's auto_prepend, and it is verified FIRST: on a POST nothing else
+ *     is parsed, and no socket is opened, until hash_equals() has passed.
+ *     Accepting a form-encoded body means a cross-origin <form> can at least
+ *     reach the parser, so that check is now load-bearing rather than
+ *     belt-and-braces (see CSRF below).
+ *   - the bridge never emits a 2xx whose body is not what the daemon sent. A
+ *     bounded (non fs/raw, non-SSE) response is read in full and checked
+ *     against its own framing before a single byte is committed; if the daemon
+ *     truncates it, or if something already started the response before we
+ *     could label it, the client gets an {ok:false} 502 envelope instead of a
+ *     plausible-looking short 200 (see "commit discipline" below).
  *   - only Range / Accept / Content-Type / Content-Length are forwarded from
  *     the client. Cookies, Authorization, X-Forwarded-*, Accept-Encoding and
  *     everything else are dropped: the daemon must never see webGUI session
@@ -58,17 +71,71 @@
  *     backticks. Path strings from the browser are only ever written into an
  *     HTTP request line on a unix socket.
  *
- * CSRF: Unraid enforces its csrf_token on every POST from
- * /usr/local/emhttp/plugins/dynamix/include/local_prepend.php (an
- * auto_prepend_file), before this script runs. We do NOT rely on that alone -
- * a misconfigured or missing prepend would otherwise silently disable the only
- * CSRF control on a root-privileged endpoint - so the token is compared here
- * too, against csrf_token in /var/local/emhttp/var.ini, with hash_equals().
- * The SPA sends it in the `X-CSRF-TOKEN` header so that the request body stays
- * byte-identical for the daemon (local_prepend strips a csrf_token POST *field*
- * from $_POST but not from php://input, which would desync Content-Length).
- * The token is handed to the SPA by FileBrowser.page on the iframe URL. GETs
- * are unaffected.
+ * ---------------------------------------------------------------------------
+ * CSRF, and why a POST body is form-encoded here
+ * ---------------------------------------------------------------------------
+ * Unraid enforces its csrf_token on every POST from
+ * /usr/local/emhttp/plugins/dynamix/include/local_prepend.php, an
+ * auto_prepend_file named in /etc/php/php.ini, which therefore runs before this
+ * script on every request. On 7.2.0 it reads the token from ONE place:
+ *
+ *     if (!isset($_POST['csrf_token'])) csrf_terminate("missing");
+ *     ...
+ *     function csrf_terminate($reason) { exec('logger ...'); exit; }
+ *
+ * $_POST is populated by PHP only for form-encoded and multipart bodies, so an
+ * application/json POST leaves it empty and every such request was rejected -
+ * by an exit() that emits no body and sets no status, which php-fpm turns into
+ * a bare 200 with an empty body. That is what the field reported as
+ * "unexpected response shape (HTTP 200)": the daemon was never contacted at
+ * all. Syslog carries the matching line:
+ *
+ *     webGUI: error: /plugins/filebrowser/proxy.php?p=... - missing csrf_token
+ *
+ * So the token has to reach $_POST. Production non-GET requests are therefore
+ * sent as
+ *
+ *     Content-Type: application/x-www-form-urlencoded; charset=UTF-8
+ *     csrf_token=<token>&payload=<urlencoded JSON body>
+ *
+ * and this script forwards the `payload` field to the daemon as a clean
+ * application/json body with a Content-Length derived from its actual bytes.
+ * The daemon's wire contract is unchanged; the envelope exists purely to get
+ * past the prepend.
+ *
+ * The token is read out of the RAW body (php://input), never out of $_POST,
+ * because both prepend generations consume what they validated:
+ * 7.2.0 does `unset($_POST['csrf_token'])` and current master additionally does
+ * `unset($_SERVER['HTTP_X_CSRF_TOKEN'])`. Reading php://input is the only
+ * source neither of them can take away, which is also what makes our own
+ * independent hash_equals() check survive a future Unraid that consumes the
+ * header. php://input is always readable here because multipart bodies - the
+ * one shape PHP does not leave in php://input - are refused outright.
+ *
+ * We do NOT rely on the prepend alone: a misconfigured or missing one would
+ * otherwise silently disable the only CSRF control on a root-privileged
+ * endpoint, so the token is compared here too, against csrf_token in
+ * /var/local/emhttp/var.ini, with hash_equals(), before anything else on a POST
+ * is parsed. The SPA also still sends X-CSRF-TOKEN, which satisfies newer
+ * Unraid prepends and is what a plain application/json POST (dev server, curl)
+ * uses. The token is handed to the SPA by FileBrowser.page on the iframe URL.
+ * GETs are unaffected - the prepend ignores them and so do we.
+ *
+ * ---------------------------------------------------------------------------
+ * Commit discipline
+ * ---------------------------------------------------------------------------
+ * Everything above is about a response that never got made. The mirror-image
+ * failure is a response that got made wrongly, and the bridge used to have no
+ * defence against it: http_response_code() and header() are silent no-ops once
+ * anything has been written, so a stray byte from an auto_prepend, or a PHP
+ * warning, would leave the daemon's 422 relabelled 200 and its Content-Length
+ * off by the length of the noise. Nothing downstream can tell.
+ *
+ * So the response is committed exactly once, at fb_commit(), which refuses to
+ * run if output has already begun, and bounded responses are read in full and
+ * validated against their own framing first. A body the bridge cannot
+ * reproduce faithfully becomes an honest {ok:false} 502 envelope - never a 2xx
+ * carrying something other than the daemon's bytes.
  */
 
 // ---------------------------------------------------------------------------
@@ -95,6 +162,15 @@ $FB_RAW_STALL    = 300;    // seconds of daemon silence that ends an fs/raw body
 // buffering: nginx takes the whole thing at once and the php-fpm worker is free
 // again immediately, which matters because a pool has only a handful of them.
 $FB_RAW_NOBUFFER = 8388608;
+
+// A bounded response (anything that is not fs/raw and not an event stream) is
+// read into memory and checked against its own framing before any of it is
+// committed - see "commit discipline" above. These are API answers: a few
+// hundred bytes for an envelope, a few hundred KB for the largest fs/view.
+// Beyond this cap we go back to streaming, which cannot verify a length but
+// also cannot mislead: a body that stops early against an honest
+// Content-Length is a transfer error every HTTP client already detects.
+$FB_RELAY_BUFFER = 8388608;
 
 // SSE budgets. A php-fpm worker is pinned for the whole life of an event
 // stream, so an abandoned tab must never hold one: we poll the socket, ping
@@ -129,16 +205,57 @@ $FB_RAW_INLINE_PREFIXES = ['audio/', 'video/'];
 @ini_set('default_charset', '');
 
 // ---------------------------------------------------------------------------
+// output discipline
+// ---------------------------------------------------------------------------
+/**
+ * Throw away anything already sitting in an output buffer. The only body this
+ * script may ever emit is its own envelope or the daemon's bytes; a newline
+ * from an auto_prepend or a PHP notice is neither, and left in place it both
+ * corrupts the JSON and desyncs the Content-Length we are about to declare.
+ * Buffered output has not reached the client yet, so dropping it is safe.
+ */
+function fb_discard_pending_output() {
+  while (ob_get_level() > 0 && ob_get_length() > 0) {
+    if (!@ob_clean()) return;   // a non-cleanable handler; nothing we can do
+  }
+}
+
+// ---------------------------------------------------------------------------
 // error envelope - matches the daemon's own {ok:false,error:{code,message}}
 // ---------------------------------------------------------------------------
 function fb_fail($status, $code, $message) {
+  fb_discard_pending_output();
   if (!headers_sent()) {
     http_response_code($status);
     header('Content-Type: application/json');
     header('Cache-Control: no-store');
   }
+  // If headers really are gone the status is a lie we cannot retract, but the
+  // body is still an envelope, and the SPA reads `ok` before it reads a status.
   echo json_encode(['ok' => false, 'error' => ['code' => $code, 'message' => $message]]);
   exit;
+}
+
+/**
+ * The single point at which this script commits to a response: status line,
+ * headers, and (for a bounded response) the whole body. It refuses to run once
+ * output has begun, because from that moment http_response_code() and header()
+ * are silent no-ops and every label we would attach is fiction.
+ *
+ * $headers is an ordered name => value map. $body is the complete body, or null
+ * when the caller is about to stream one itself.
+ */
+function fb_commit($status, array $headers, $body = null) {
+  if (headers_sent($file, $line)) {
+    fb_fail(502, 'INTERNAL',
+      'response already started before the relay could label it (' . $file . ':' . $line . ')');
+  }
+  fb_discard_pending_output();
+  http_response_code($status);
+  foreach ($headers as $name => $value) {
+    header($name . ': ' . $value);
+  }
+  if ($body !== null) echo $body;
 }
 
 // A header value that survives to the socket must not be able to break framing.
@@ -166,6 +283,29 @@ function fb_expected_csrf($file) {
     }
   }
   return null;
+}
+
+/**
+ * Parse an application/x-www-form-urlencoded body ourselves, from the raw
+ * bytes, into name => value. Deliberately not parse_str(): that mangles field
+ * names (dots and spaces become underscores), silently builds arrays out of
+ * `a[]`, and drops everything past max_input_vars. We want the two names we
+ * know about and a hard error on anything else.
+ *
+ * Returns null when the body is not a well-formed pair list.
+ */
+function fb_parse_form($raw) {
+  $out = [];
+  if ($raw === '') return $out;
+  foreach (explode('&', $raw) as $pair) {
+    if ($pair === '') continue;
+    $eq = strpos($pair, '=');
+    if ($eq === false) return null;                 // a bare flag is not our shape
+    $name = urldecode(substr($pair, 0, $eq));
+    if ($name === '' || isset($out[$name])) return null;   // empty or duplicated
+    $out[$name] = urldecode(substr($pair, $eq + 1));
+  }
+  return $out;
 }
 
 /** Content-Type without parameters, lowercased. */
@@ -206,6 +346,84 @@ if ($method !== 'GET' && $method !== 'POST') {
   fb_fail(405, 'BAD_REQUEST', 'only GET and POST are supported');
 }
 
+// ---- POST body + CSRF, before anything else -------------------------------
+// A form-encoded body means a cross-origin <form> can reach this parser, so
+// the token check is the control that keeps it out and it runs first: no other
+// parameter is examined, and no socket is opened, until hash_equals() passes.
+$body  = '';        // the bytes we will forward to the daemon
+$ctype = null;      // the Content-Type we will forward with them
+if ($method === 'POST') {
+  // Shape. json = the body IS the upstream body (dev server, curl).
+  // form = the Unraid envelope: csrf_token + payload (see CSRF above).
+  // Multipart is refused outright, which is also what guarantees php://input
+  // still holds the raw bytes below.
+  $inCtype = fb_clean_header($_SERVER['CONTENT_TYPE'] ?? '');
+  $inMime  = ($inCtype === null) ? '' : fb_mime_only($inCtype);
+  if ($inMime !== 'application/json' && $inMime !== 'application/x-www-form-urlencoded') {
+    fb_fail(415, 'BAD_REQUEST',
+      'POST body must be application/json or the application/x-www-form-urlencoded envelope');
+  }
+
+  // Raw bytes, never $_POST: both prepend generations unset what they consumed
+  // ($_POST['csrf_token'] on 7.2.0, plus $_SERVER['HTTP_X_CSRF_TOKEN'] on
+  // master), and php://input is the one copy neither can take away.
+  $raw = (string)@file_get_contents('php://input');
+
+  $provided = null;
+  if ($inMime === 'application/x-www-form-urlencoded') {
+    $fields = fb_parse_form($raw);
+    if ($fields === null) {
+      fb_fail(400, 'BAD_REQUEST', 'malformed form-encoded body');
+    }
+    foreach ($fields as $name => $_unused) {
+      if ($name !== 'csrf_token' && $name !== 'payload') {
+        fb_fail(400, 'BAD_REQUEST', 'unexpected field in the request envelope');
+      }
+    }
+    if (isset($fields['csrf_token'])) {
+      $provided = fb_clean_header($fields['csrf_token']);
+    }
+    $body  = $fields['payload'] ?? '';
+    $ctype = 'application/json';
+  } else {
+    $body  = $raw;
+    $ctype = $inCtype;
+  }
+
+  // Fallbacks for the json shape and for anything hand-rolled: the header the
+  // SPA still sends, then the field PHP parsed for us. Either may already have
+  // been consumed by the prepend, which is why the raw body wins above.
+  if ($provided === null) {
+    $provided = fb_clean_header($_SERVER['HTTP_X_CSRF_TOKEN'] ?? '');
+  }
+  if ($provided === null && isset($_POST['csrf_token']) && is_string($_POST['csrf_token'])) {
+    $provided = fb_clean_header($_POST['csrf_token']);
+  }
+
+  $expected = fb_expected_csrf($FB_VAR_INI);
+  if ($expected === null) {
+    fb_fail(403, 'FORBIDDEN', 'csrf token unavailable');
+  }
+  if ($provided === null || !hash_equals($expected, $provided)) {
+    fb_fail(403, 'FORBIDDEN', 'invalid or missing csrf token');
+  }
+
+  // The daemon is handed JSON and nothing else, whichever shape carried it.
+  if ($inMime === 'application/x-www-form-urlencoded') {
+    if ($body === '') {
+      fb_fail(400, 'BAD_REQUEST', 'request envelope has no payload');
+    }
+    $head = ltrim($body);
+    if ($head === '' || ($head[0] !== '{' && $head[0] !== '[')) {
+      fb_fail(400, 'BAD_REQUEST', 'payload must be a JSON object or array');
+    }
+    json_decode($body);
+    if (json_last_error() !== JSON_ERROR_NONE) {
+      fb_fail(400, 'BAD_REQUEST', 'payload is not valid JSON: ' . json_last_error_msg());
+    }
+  }
+}
+
 $p = $_GET['p'] ?? '';
 if (!is_string($p) || $p === '') {
   fb_fail(400, 'BAD_REQUEST', 'missing p parameter');
@@ -231,7 +449,6 @@ if (strpos($pathOnly, '..') !== false) {
 // applies. Only PUT is translatable; the override never reaches the daemon as
 // a header, only as the upstream request method.
 $upstreamMethod = $method;
-$ctype = null;
 if ($method === 'POST') {
   $override = fb_clean_header($_SERVER['HTTP_X_HTTP_METHOD_OVERRIDE'] ?? '');
   if ($override !== null) {
@@ -240,38 +457,6 @@ if ($method === 'POST') {
     }
     $upstreamMethod = 'PUT';
   }
-
-  // Body content type: JSON only. The SPA never sends anything else, and a
-  // cross-origin <form> cannot produce application/json without a preflight.
-  $ctype = fb_clean_header($_SERVER['CONTENT_TYPE'] ?? '');
-  if ($ctype === null || fb_mime_only($ctype) !== 'application/json') {
-    fb_fail(415, 'BAD_REQUEST', 'POST body must be application/json');
-  }
-
-  // CSRF, verified here and not only in Unraid's auto_prepend.
-  $expected = fb_expected_csrf($FB_VAR_INI);
-  $provided = fb_clean_header($_SERVER['HTTP_X_CSRF_TOKEN'] ?? '');
-  if ($provided === null && isset($_POST['csrf_token']) && is_string($_POST['csrf_token'])) {
-    $provided = fb_clean_header($_POST['csrf_token']);
-  }
-  if ($expected === null) {
-    fb_fail(403, 'FORBIDDEN', 'csrf token unavailable');
-  }
-  if ($provided === null || !hash_equals($expected, $provided)) {
-    fb_fail(403, 'FORBIDDEN', 'invalid or missing csrf token');
-  }
-}
-
-// ---------------------------------------------------------------------------
-// request body (POST only)
-// ---------------------------------------------------------------------------
-// Only application/json gets this far, so PHP never populated $_POST from the
-// body and php://input always holds it verbatim - no rebuild, no Content-Length
-// desync, and the csrf_token the SPA sends as a header is not in the body at
-// all so the daemon never sees it.
-$body = '';
-if ($method === 'POST') {
-  $body = (string)@file_get_contents('php://input');
 }
 
 // ---------------------------------------------------------------------------
@@ -321,29 +506,51 @@ if (@fwrite($sock, $req) === false) {
 // ---------------------------------------------------------------------------
 // read the status line and response headers
 // ---------------------------------------------------------------------------
-$statusLine = @fgets($sock, 8192);
-if ($statusLine === false || $statusLine === '') {
-  fclose($sock);
-  fb_fail(502, 'INTERNAL', 'daemon not running');
-}
-if (!preg_match('#^HTTP/1\.[01]\s+(\d{3})#', $statusLine, $m)) {
-  fclose($sock);
-  fb_fail(502, 'INTERNAL', 'malformed response from daemon');
-}
-$status = (int)$m[1];
-
+// A 1xx is a prelude, not an answer: relaying it as the final status would put
+// the real response - status line and all - into the client's body. Skip past
+// any that arrive and keep reading. The bound stops a daemon that only ever
+// sends preludes from spinning here.
+$status   = 0;
 $upstream = [];
-while (true) {
-  $line = @fgets($sock, 16384);
-  if ($line === false) {
+for ($prelude = 0; $prelude < 8; $prelude++) {
+  $statusLine = @fgets($sock, 8192);
+  if ($statusLine === false || $statusLine === '') {
     fclose($sock);
-    fb_fail(502, 'INTERNAL', 'truncated response from daemon');
+    fb_fail(502, 'INTERNAL', 'daemon not running');
   }
-  $line = rtrim($line, "\r\n");
-  if ($line === '') break;
-  $colon = strpos($line, ':');
-  if ($colon === false) continue;
-  $upstream[strtolower(substr($line, 0, $colon))] = trim(substr($line, $colon + 1));
+  if (!preg_match('#^HTTP/1\.[01]\s+(\d{3})#', $statusLine, $m)) {
+    fclose($sock);
+    fb_fail(502, 'INTERNAL', 'malformed response from daemon');
+  }
+  $status   = (int)$m[1];
+  $upstream = [];
+  while (true) {
+    $line = @fgets($sock, 16384);
+    if ($line === false) {
+      fclose($sock);
+      fb_fail(502, 'INTERNAL', 'truncated response from daemon');
+    }
+    $line = rtrim($line, "\r\n");
+    if ($line === '') break;
+    $colon = strpos($line, ':');
+    if ($colon === false) continue;
+    $upstream[strtolower(substr($line, 0, $colon))] = trim(substr($line, $colon + 1));
+  }
+  if ($status < 100 || $status >= 200) break;
+}
+if ($status < 200) {
+  fclose($sock);
+  fb_fail(502, 'INTERNAL', 'daemon sent only informational responses');
+}
+
+// We never send Accept-Encoding, so a coded body is not something we asked for
+// and not something we relay a Content-Encoding for. Passing the coded bytes on
+// under a plain Content-Type would be exactly the misrepresentation this bridge
+// promises never to make.
+$upEnc = strtolower(trim($upstream['content-encoding'] ?? ''));
+if ($upEnc !== '' && $upEnc !== 'identity') {
+  fclose($sock);
+  fb_fail(502, 'INTERNAL', 'daemon sent an encoded body (' . $upEnc . ') that the bridge cannot relay');
 }
 
 $upType   = $upstream['content-type'] ?? '';
@@ -353,9 +560,12 @@ $hasLen   = array_key_exists('content-length', $upstream) && !$chunked;
 $bodyLen  = $hasLen ? (int)$upstream['content-length'] : -1;
 
 // ---------------------------------------------------------------------------
-// relay status + whitelisted headers
+// build the outgoing status + whitelisted headers  (nothing is sent yet)
 // ---------------------------------------------------------------------------
-http_response_code($status);
+// These are staged rather than emitted so that fb_commit() stays the one place
+// the response is decided - see "commit discipline" at the top. Until then this
+// script has produced no output at all and can still answer with an envelope.
+$outHeaders = [];
 
 $relay = [
   'content-type'            => 'Content-Type',
@@ -368,7 +578,7 @@ $relay = [
 ];
 foreach ($relay as $key => $name) {
   if (isset($upstream[$key]) && strpbrk($upstream[$key], "\r\n") === false) {
-    header($name . ': ' . $upstream[$key]);
+    $outHeaders[$name] = $upstream[$key];
   }
 }
 
@@ -376,11 +586,11 @@ foreach ($relay as $key => $name) {
 // Belt and braces with the daemon, which enforces the same rules: a plugin and
 // a daemon of different vintages must never combine into "arbitrary file body
 // rendered as a document on the root-authenticated webGUI origin". These
-// header() calls replace whatever was relayed above.
+// entries replace whatever was relayed above.
 $isRaw = ($pathOnly === '/api/v1/fs/raw');
 if ($isRaw) {
-  header('X-Content-Type-Options: nosniff');
-  header("Content-Security-Policy: default-src 'none'; sandbox");
+  $outHeaders['X-Content-Type-Options']  = 'nosniff';
+  $outHeaders['Content-Security-Policy'] = "default-src 'none'; sandbox";
 
   $mime   = fb_mime_only($upType);
   $inline = in_array($mime, $FB_RAW_INLINE_TYPES, true);
@@ -390,15 +600,16 @@ if ($isRaw) {
     }
   }
   if (!$inline) {
-    header('Content-Type: application/octet-stream');
-    header('Content-Disposition: ' . fb_attachment_disposition($upstream['content-disposition'] ?? ''));
+    $outHeaders['Content-Type']        = 'application/octet-stream';
+    $outHeaders['Content-Disposition'] = fb_attachment_disposition($upstream['content-disposition'] ?? '');
   }
 }
 
 // Content-Length only when we relay the body verbatim. Chunked bodies are
-// decoded here and emitted plain, so the upstream length would be wrong.
+// decoded here and emitted plain, so the upstream length would be wrong; the
+// buffered path below replaces it with the length it actually measured.
 if ($hasLen && !$isSse) {
-  header('Content-Length: ' . $bodyLen);
+  $outHeaders['Content-Length'] = (string)$bodyLen;
 }
 
 // ---------------------------------------------------------------------------
@@ -428,6 +639,10 @@ if ($hasLen && !$isSse) {
 //     promptly so the daemon stops reading the file. $emit's connection_aborted()
 //     check is the graceful path; PHP aborting the request outright is fine too.
 if ($isRaw) {
+  if (!$hasLen || $bodyLen >= $FB_RAW_NOBUFFER) {
+    $outHeaders['X-Accel-Buffering'] = 'no';
+  }
+  fb_commit($status, $outHeaders);          // headers staged; still no output
   @set_time_limit(0);
   @ini_set('zlib.output_compression', 'Off');
   @ini_set('implicit_flush', '1');
@@ -435,9 +650,6 @@ if ($isRaw) {
     if (!@ob_end_flush()) break;
   }
   ob_implicit_flush(true);
-  if (!$hasLen || $bodyLen >= $FB_RAW_NOBUFFER) {
-    header('X-Accel-Buffering: no');
-  }
   ignore_user_abort(false);
 }
 
@@ -451,6 +663,12 @@ if ($isRaw) {
 // $FB_SSE_SILENCE of real silence and never runs longer than $FB_SSE_MAXLIFE.
 // EventSource reconnects on its own, so the cap is invisible to the user.
 if ($isSse) {
+  // nginx sits in front of php-fpm; without X-Accel-Buffering it would buffer
+  // the stream.
+  $outHeaders['X-Accel-Buffering'] = 'no';
+  $outHeaders['Cache-Control']     = 'no-cache';
+  $outHeaders['Connection']        = 'keep-alive';
+  fb_commit($status, $outHeaders);
   @ini_set('zlib.output_compression', 'Off');
   @ini_set('output_buffering', 'Off');
   @ini_set('implicit_flush', '1');
@@ -458,10 +676,6 @@ if ($isSse) {
     if (!@ob_end_flush()) break;
   }
   ob_implicit_flush(true);
-  // nginx sits in front of php-fpm; without this it would buffer the stream.
-  header('X-Accel-Buffering: no');
-  header('Cache-Control: no-cache');
-  header('Connection: keep-alive');
   ignore_user_abort(true);   // we decide when to stop, so the socket is closed
   @set_time_limit(0);
   // Non-blocking for the whole stream: a blocking fread() waits until it can
@@ -617,12 +831,57 @@ $read_line = function ($max) use ($sock, $keep_waiting) {
   }
 };
 
+// ---------------------------------------------------------------------------
+// faithful-or-fail
+// ---------------------------------------------------------------------------
+// fs/raw has already committed above and streams; it is a file transfer, where
+// a stall is normal and buffering is not an option. Everything else is an API
+// answer of bounded size, so we read it in full and check it against its own
+// framing FIRST, and only then commit. A daemon that stops mid-body therefore
+// produces a 502 envelope, not a 200 with a plausible-looking short body.
+//
+// $sink is what makes that safe for a body we cannot size in advance (chunked,
+// or close-delimited): it accumulates until $FB_RELAY_BUFFER, and if the body
+// turns out to be bigger than that it commits what it has - without a
+// Content-Length, because on those framings we never promised one - and
+// switches to streaming the rest. Nothing is buffered without bound and nothing
+// is promised that we might not deliver.
+$streaming = $isRaw;
+$bodyBuf   = '';
+
+$commit_stream = function ($dropLength = false) use (&$streaming, &$outHeaders, $status) {
+  $h = $outHeaders;
+  if ($dropLength) unset($h['Content-Length']);
+  fb_commit($status, $h);
+  $streaming = true;
+};
+
+$sink = function ($data) use (&$bodyBuf, &$streaming, &$commit_stream, $emit, $FB_RELAY_BUFFER) {
+  if ($streaming) return $emit($data);
+  $bodyBuf .= $data;
+  if (strlen($bodyBuf) <= $FB_RELAY_BUFFER) return true;
+  $commit_stream(true);
+  $out     = $bodyBuf;
+  $bodyBuf = '';
+  return $emit($out);
+};
+
+// A Content-Length framed body too big to hold is streamed against the
+// daemon's own honest length - there is nothing for us to verify that the
+// client cannot verify itself.
+if (!$streaming && $hasLen && $bodyLen > $FB_RELAY_BUFFER) {
+  $commit_stream();
+}
+
+$truncated = false;
+
 if ($status === 204 || $status === 304) {
   // no body
 
 } elseif ($chunked) {
   // ---- chunked transfer coding: decode, emit plain ------------------------
-  $stop = false;
+  $stop     = false;
+  $sawFinal = false;
   while (!$stop && !feof($sock)) {
     $line = $read_line(1024);
     if ($line === false) break;
@@ -633,7 +892,7 @@ if ($status === 204 || $status === 304) {
     $line = trim($line);
     if ($line === '' || !preg_match('/^[0-9A-Fa-f]{1,8}$/D', $line)) break;
     $remaining = hexdec($line);
-    if ($remaining === 0) break;                      // last chunk (trailers ignored)
+    if ($remaining === 0) { $sawFinal = true; break; } // last chunk (trailers ignored)
     while ($remaining > 0) {
       $buf = $read_body(min($FB_CHUNK, $remaining));
       if ($buf === '') {                              // end of body
@@ -641,7 +900,7 @@ if ($status === 204 || $status === 304) {
         break;
       }
       $remaining -= strlen($buf);
-      if (!$emit($buf)) {                             // client went away
+      if (!$sink($buf)) {                             // client went away
         $stop = true;
         break;
       }
@@ -649,6 +908,8 @@ if ($status === 204 || $status === 304) {
     if ($stop) break;
     @fread($sock, 2);                                 // trailing CRLF
   }
+  // No terminating 0-chunk means the daemon died mid-answer.
+  if (!$sawFinal && !$stop) $truncated = true;
 
 } elseif ($hasLen) {
   // ---- Content-Length framing --------------------------------------------
@@ -657,16 +918,31 @@ if ($status === 204 || $status === 304) {
     $buf = $read_body(min($FB_CHUNK, $remaining));
     if ($buf === '') break;
     $remaining -= strlen($buf);
-    if (!$emit($buf)) break;
+    if (!$sink($buf)) break;
   }
+  if ($remaining > 0 && !$streaming) $truncated = true;
 
 } else {
   // ---- read until the daemon closes (we asked for Connection: close) ------
   while (!feof($sock)) {
     $buf = $read_body($FB_CHUNK);
     if ($buf === '') break;
-    if (!$emit($buf)) break;
+    if (!$sink($buf)) break;
   }
 }
 
 fclose($sock);
+
+if (!$streaming) {
+  if ($truncated) {
+    fb_fail(502, 'INTERNAL', 'truncated response from daemon: ' . strlen($bodyBuf)
+      . ' of ' . ($hasLen ? $bodyLen . ' bytes' : 'an unfinished chunked body'));
+  }
+  // The measured length is authoritative: it equals the upstream one on a
+  // Content-Length body (we just verified that) and is the only correct value
+  // for a body we de-chunked.
+  if ($status !== 204 && $status !== 304) {
+    $outHeaders['Content-Length'] = (string)strlen($bodyBuf);
+  }
+  fb_commit($status, $outHeaders, $bodyBuf);
+}
