@@ -174,10 +174,10 @@ start() {
   nohup "${BIN}" -socket "${SOCKET}" -data "${DATA_DIR}" -roots "${BROWSE_ROOTS}" >> "${LOGFILE}" 2>&1 &
   echo $! > "${PIDFILE}"
 
-  # Wait up to ~10s for the socket to appear so callers (webGUI buttons, the
+  # Wait up to ~30s for the socket to appear so callers (webGUI buttons, the
   # install script, the array-start event) get a truthful exit status.
   local i
-  for i in $(seq 1 50); do
+  for i in $(seq 1 150); do
     [ -S "${SOCKET}" ] && break
     running || break
     sleep 0.2

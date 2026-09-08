@@ -33,6 +33,7 @@
 - Either plugin may be installed first; Settings > File Browser Settings shows whether transcoding is available and how to add it
 - Everything else still works without the companion plugin: browsing, search, viewing, downloads and native playback are unaffected
 - Bookmarkable deep links: the page URL carries ?path= and follows you as you navigate
+- Fix: the daemon reported "failed to start" when opening a large index on a cold array took longer than the start timeout. The socket is now bound before the index opens, so browsing, viewing and playback are available immediately and the index attaches when it is ready
 
 ###2026.09.07d
 - Fix: updates were recorded as installed without actually installing (Unraid's upgradepkg skipped the package as "not newer"); the installer now replaces the package explicitly and verifies the installed version

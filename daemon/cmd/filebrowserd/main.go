@@ -13,6 +13,8 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -44,6 +46,121 @@ func (p *persistingIndex) SetConfig(cfg types.IndexConfig) error {
 		log.Printf("warning: config applied but not persisted: %v", err)
 	}
 	return nil
+}
+
+// lazyIndex serves index endpoints while the database is still opening.
+//
+// Opening the index does real work (schema migration, an out-of-root sweep,
+// permission fixups) against a database that lives on the array, so on a large
+// index or a spun-down disk it can take a minute. Doing that before binding
+// the socket made rc.filebrowserd's 10s start timeout fire and report a
+// perfectly healthy daemon as failed — and it contradicted the design rule
+// that browsing and streaming never depend on the index. So the listener comes
+// up first and this stands in until the real service is ready.
+type lazyIndex struct {
+	ready atomic.Pointer[persistingIndex]
+	// cfg is what was loaded from disk, so the settings page can render before
+	// the database is open.
+	cfg   types.IndexConfig
+	roots []string
+}
+
+func (l *lazyIndex) set(p *persistingIndex) { l.ready.Store(p) }
+
+var errStarting = types.Errf(types.ErrIndexing, "the index is still starting")
+
+func (l *lazyIndex) Search(ctx context.Context, q types.SearchQuery) ([]types.SearchHit, int, error) {
+	if p := l.ready.Load(); p != nil {
+		return p.Search(ctx, q)
+	}
+	return nil, 0, errStarting
+}
+
+func (l *lazyIndex) Status() types.IndexStatus {
+	if p := l.ready.Load(); p != nil {
+		return p.Status()
+	}
+	return types.IndexStatus{State: "starting"}
+}
+
+// Subscribe hands back a channel that starts forwarding as soon as the real
+// service exists, so an SSE client that connected during startup does not have
+// to reconnect to see progress.
+func (l *lazyIndex) Subscribe() (<-chan types.IndexStatus, func()) {
+	if p := l.ready.Load(); p != nil {
+		return p.Subscribe()
+	}
+	out := make(chan types.IndexStatus, 1)
+	done := make(chan struct{})
+	var once sync.Once
+	cancel := func() { once.Do(func() { close(done) }) }
+	go func() {
+		defer close(out)
+		tick := time.NewTicker(500 * time.Millisecond)
+		defer tick.Stop()
+		var real *persistingIndex
+		for real == nil {
+			select {
+			case <-done:
+				return
+			case <-tick.C:
+				real = l.ready.Load()
+			}
+		}
+		src, unsub := real.Subscribe()
+		defer unsub()
+		for {
+			select {
+			case <-done:
+				return
+			case st, ok := <-src:
+				if !ok {
+					return
+				}
+				select {
+				case out <- st:
+				case <-done:
+					return
+				}
+			}
+		}
+	}()
+	return out, cancel
+}
+
+func (l *lazyIndex) Config() types.IndexConfig {
+	if p := l.ready.Load(); p != nil {
+		return p.Config()
+	}
+	return l.cfg
+}
+
+func (l *lazyIndex) SetConfig(cfg types.IndexConfig) error {
+	if p := l.ready.Load(); p != nil {
+		return p.SetConfig(cfg)
+	}
+	return errStarting
+}
+
+func (l *lazyIndex) AllowedRoots() []string { return l.roots }
+
+func (l *lazyIndex) Rescan(path string) error {
+	if p := l.ready.Load(); p != nil {
+		return p.Rescan(path)
+	}
+	return errStarting
+}
+
+func (l *lazyIndex) Pause() {
+	if p := l.ready.Load(); p != nil {
+		p.Pause()
+	}
+}
+
+func (l *lazyIndex) Resume() {
+	if p := l.ready.Load(); p != nil {
+		p.Resume()
+	}
 }
 
 // parseRoots validates the -roots flag: absolute, cleaned, non-empty paths.
@@ -153,17 +270,30 @@ func run(dev bool, listen, socket, dataDir, rootList string, rootOverride bool) 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	var idx *index.Service
+	lazy := &lazyIndex{cfg: cfg.Index, roots: browseRoots}
+	deps.Index = lazy
 	if dataDirOK {
-		idx, err = index.New(filepath.Join(dataDir, "index.db"), cfg.Index, index.Options{AllowedRoots: browseRoots})
-		if err != nil {
-			log.Printf("warning: index unavailable: %v", err)
-		} else {
-			defer idx.Close()
-			go idx.RunScheduler(ctx)
-			deps.Index = &persistingIndex{Service: idx, cfgPath: cfgPath, dataDir: dataDir}
-		}
+		// Opening the index can take a minute on a cold array; do it behind the
+		// listener so browsing, viewing and playback are available immediately.
+		go func() {
+			idx, err := index.New(filepath.Join(dataDir, "index.db"), cfg.Index, index.Options{AllowedRoots: browseRoots})
+			if err != nil {
+				log.Printf("warning: index unavailable: %v", err)
+				return
+			}
+			lazy.set(&persistingIndex{Service: idx, cfgPath: cfgPath, dataDir: dataDir})
+			log.Printf("index ready")
+			idx.RunScheduler(ctx)
+		}()
 	}
+	// Closed through the lazy holder: an open still in flight at shutdown is
+	// abandoned with the process, which is harmless (SQLite recovers from its
+	// WAL) and avoids blocking exit on a cold disk.
+	defer func() {
+		if p := lazy.ready.Load(); p != nil {
+			p.Close()
+		}
+	}()
 
 	var ln net.Listener
 	if dev {
