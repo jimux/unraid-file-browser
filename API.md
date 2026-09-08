@@ -95,9 +95,11 @@ Multi-byte windows are cut on code-point boundaries where possible.
 → `{ encodings: [{ id: "utf-8", label: "UTF-8" }, ...] }` — order = picker order.
 
 ### `GET /search`
-`q` (required), `mode` = `name|content|both` (default `both`),
+`q` (**optional**, see below), `mode` = `name|content|both` (default `both`),
 `path` (scope prefix, optional), `ext` (comma list, optional),
 `minSize`/`maxSize` (bytes), `after`/`before` (unix seconds, mtime),
+`meta` (repeatable metadata filter, see **Metadata search**),
+`sort` = `relevance|name|size|mtime`, `dir` = `asc|desc`,
 `limit` (default 100, max 1000), `offset`.
 → `{ hits: SearchHit[], total: number, indexFresh: boolean, tookMs: number }`
 `q` supports FTS5-style quoting; bare terms are prefix-matched on names.
@@ -107,8 +109,68 @@ when prefix matching finds nothing requires every term to be at least
 **3 characters**. Results are always confined to the current index roots
 *and* the daemon's browse roots, regardless of what was indexed earlier.
 
+**`q` is optional, but only when something else narrows the search.** A
+request with no `q` (absent, empty, or whitespace) is valid as long as it
+carries at least one of `path`, `ext`, `minSize`, `maxSize`, `after`, `before`
+or `meta` — that is the "every file bigger than 20 GB" query, which needs no
+search term. With neither `q` nor a filter the request is `BAD_REQUEST`
+("q is required unless at least one filter is given …"): asking for the whole
+index is a mistake, not a query. Whitespace-only `q` is normalised to empty
+before the filter check, so `?q=%20&minSize=1` is a filters-only search.
+
+`sort` defaults to **`relevance` when `q` is present and `name` ascending when
+it is not**. Both parameters are applied by the index; when the client omits
+them the HTTP layer forwards them unset rather than substituting a default of
+its own, so the index's default is what a bare request gets. Unknown values are
+`BAD_REQUEST` (note `type`, valid for `fs/list`, is **not** a search sort key).
+`sort=relevance` on a filters-only search has nothing to rank and falls back to
+the index's `name` ordering.
+
+### `GET /search/fields`
+No parameters. → `{ categories: MetaCategory[] }`
+
+The metadata vocabulary: which categories exist, which fields each carries,
+and — for `enum` fields — the fixed value list. Static for a given daemon
+build, so the SPA may fetch it once and cache it. Arrays are never `null`.
+
+### `GET /search/values`
+`key` (**required**, a key from `/search/fields`), `prefix` (optional, narrows to
+values starting with it — for type-ahead), `path` (optional scope prefix),
+`limit` (default 200, max 500 — larger is clamped, not refused).
+→ `{ values: MetaValue[] }`
+
+The distinct values recorded for one metadata key, each with the number of
+files carrying it, ordered by the index (most useful first) and truncated to
+`limit`. A missing or malformed `key` is `BAD_REQUEST`; an unknown but
+well-formed key is simply an empty list. `values` is never `null`.
+This endpoint is called interactively while the user types, so
+it shares the in-flight budget described under **Load shedding**; `/search/fields`
+does not (it is a static read).
+
+```ts
+interface MetaValue { value: string; count: number }
+
+interface MetaCategory {
+  id: string;            // "common" | "image" | "video" | "audio" | "package"
+  label: string;         // UI heading, e.g. "Photo"
+  extensions: string[];  // the category's default file extensions, lowercase,
+                         // no dot; [] for "common", which applies to every file
+  fields: MetaFieldDef[];
+}
+
+interface MetaFieldDef {
+  key: string;           // "image.cameraModel"; bare for the common category
+  label: string;         // "Camera model"
+  type: "text" | "number" | "bytes" | "date" | "enum" | "bool";
+  unit?: string;         // display hint for numbers: "px", "s", "mm", "bit/s"
+  values?: MetaEnumValue[]; // enum and bool fields only; absent otherwise
+}
+
+interface MetaEnumValue { value: string; label: string }
+```
+
 ### Index management
-- `GET /index/status` → `{ state: "idle"|"crawling"|"extracting", filesIndexed,
+- `GET /index/status` → `{ state: "idle"|"crawling"|"extracting"|"metadata", filesIndexed,
   contentIndexed, dbBytes, lastFullScan, current?: string, progress?: number }`
 - `GET /index/events` → SSE stream of status objects (same shape), min 1/s max.
   The daemon also emits a comment frame `: keepalive` every **15 s** when no
@@ -229,6 +291,75 @@ idle; a segment has **60 s** of wall time; playlists are capped at
 → `{ version, uptimeSec, indexDb: "ok"|"missing"|"error", roots: string[] }`
 `roots` are the browse roots the daemon was started with (`-roots`).
 
+## Metadata search
+
+Metadata keys are **`<category>.<field>`**: the category is lowercase
+(`^[a-z]+$`), the field is a letters-only lowerCamelCase name (`^[A-Za-z]+$`)
+— e.g. `image.cameraModel`, `video.hdr`, `audio.artist`, `image.iso`. The one
+exception is the **`common`** category, whose keys are bare (`name`, `ext`,
+`size`, `mtime`, `mime`): they are columns every indexed file already has
+rather than extracted metadata. So the accepted key syntax is
+`^[a-z]+(\.[A-Za-z]+)?$`, and every key `/search/fields` serves is a key
+`/search` and `/search/values` accept — a dropdown never offers a field it
+cannot then query. Anything else is rejected by both endpoints with
+`BAD_REQUEST`, before it reaches the index.
+
+A filter is one `meta` parameter of the form `<key><op><value>`, repeated for
+each condition (they combine with AND). At most **16** `meta` parameters per
+request; beyond that, `BAD_REQUEST`.
+
+| Operator | Meaning | Example |
+| --- | --- | --- |
+| `=` | equals | `meta=image.cameraModel=DMC-GH5` |
+| `!=` | not equal | `meta=video.hdr!=none` |
+| `~` | contains (case-insensitive substring) | `meta=audio.artist~davis` |
+| `>` | greater than | `meta=video.durationSec>3600` |
+| `>=` | greater than or equal | `meta=image.iso>=800` |
+| `<` | less than | `meta=image.iso<200` |
+| `<=` | less than or equal | `meta=video.height<=1080` |
+
+The ordering operators apply to numeric field types (`number`, `bytes`,
+`date` — dates accept RFC3339 or unix seconds); `~` is a case-insensitive
+substring match on text. `!=` means "this file has no value of this key equal
+to *value*", so a file with two audio tracks, one AC-3 and one AAC, does **not**
+match `meta=video.audioCodec!=ac3`.
+
+Parsing rule: the daemon scans left to right for the **first** operator after
+the key, testing the two-character operators (`>=`, `<=`, `!=`) before the
+one-character ones at the same position. Everything before it is the key,
+everything after it is the value — so a value may itself contain `=`, `~`,
+`<` or `>` (`meta=audio.title=a=b` searches for the literal `a=b`). Whitespace
+around the key, operator and value is trimmed. An empty value, a missing
+operator, or a key that fails the pattern is `BAD_REQUEST` naming the offending
+`meta` item.
+
+Values are ordinary query-string values: percent-encode them (`+` and `%20`
+both decode to a space) and let the daemon decode once — it never decodes
+twice, so a literal `%2F` in a title survives as `%2F`. The value is forwarded
+to the index verbatim and compared there according to the field's declared
+`type` (`number`, `bytes` and `date` numerically, the rest as text); the HTTP
+layer validates only the shape of the clause, never the value's contents.
+
+**Categories are a client-side convenience.** Each `MetaCategory` carries the
+default `extensions` for its kind of file, and it is the *client* that turns a
+chosen category into a plain `ext=` parameter on `/search` (e.g. picking
+"Photo" sends `ext=jpg,jpeg,png,heic,…`). The `common` category has no
+extensions — its fields apply to every indexed file. The daemon therefore has no
+`category` parameter: the category exists only to shape the dropdowns and to
+pre-fill the extension list, which the user can then widen or narrow. Combining
+`ext` with `meta` is the normal case — the extension list keeps the query on
+the right files and the meta filters do the actual selecting.
+
+Example — GH5 stills at ISO 800 or above, shot since 2024, in one share:
+
+```
+GET /api/v1/search?ext=jpg,jpeg,raw,rw2&path=/mnt/user/photos
+   &meta=image.cameraModel%3DDMC-GH5&meta=image.iso%3E%3D800
+   &after=1704067200&sort=mtime&dir=desc
+```
+
+(no `q` — the filters are the query.)
+
 ## Raw content policy (`fs/raw`)
 
 The SPA is served inside the Unraid webGUI origin, so anything the browser
@@ -264,8 +395,9 @@ XML — use `fs/view` (text) or `fs/hex` for those.
 
 ## Load shedding
 
-`fs/list`, `search` and `fs/view` on virtual (archive) paths share a global
-in-flight budget of **8** concurrent requests. A request that cannot get a slot
+`fs/list`, `search`, `search/values` and `fs/view` on virtual (archive) paths
+share a global in-flight budget of **8** concurrent requests.
+(`search/fields` is a static read and is not in the budget.) A request that cannot get a slot
 within **5 s** is answered `TIMEOUT` (504) with the message `server busy` — it
 never ran, so `INDEXING` would be a lie. Clients should retry with backoff.
 

@@ -133,13 +133,46 @@ type fakeIndex struct {
 
 	allowedRoots []string
 
+	categories []types.MetaCategory
+	values     []types.MetaValue
+	valuesErr  error
+
 	mu          sync.Mutex
 	lastQuery   types.SearchQuery
+	lastValues  metaValuesCall
+	valuesCalls int
 	rescanPaths []string
 	paused      int
 	resumed     int
 	events      chan types.IndexStatus
 	unsubscribe int
+}
+
+// metaValuesCall records the arguments of the last MetaValues call.
+type metaValuesCall struct {
+	key    string
+	prefix string
+	path   string
+	limit  int
+}
+
+func (i *fakeIndex) MetaFields() []types.MetaCategory { return i.categories }
+
+func (i *fakeIndex) MetaValues(ctx context.Context, key, prefix, pathScope string, limit int) ([]types.MetaValue, error) {
+	i.mu.Lock()
+	i.lastValues = metaValuesCall{key: key, prefix: prefix, path: pathScope, limit: limit}
+	i.valuesCalls++
+	i.mu.Unlock()
+	if i.valuesErr != nil {
+		return nil, i.valuesErr
+	}
+	return i.values, nil
+}
+
+func (i *fakeIndex) valuesCall() metaValuesCall {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return i.lastValues
 }
 
 func (i *fakeIndex) Search(ctx context.Context, q types.SearchQuery) ([]types.SearchHit, int, error) {

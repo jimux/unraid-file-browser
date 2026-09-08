@@ -16,8 +16,11 @@ import (
 )
 
 // schemaVersion is stamped into PRAGMA user_version. Bump it and add a
-// migration step in migrate() when the schema changes.
-const schemaVersion = 1
+// migration step to migrations when the schema changes.
+//
+//	v1  files, names_fts, content_fts, meta
+//	v2  files.meta_extracted, file_meta (embedded metadata rows)
+const schemaVersion = 2
 
 // schemaDDL is executed statement-by-statement when the database is new
 // (user_version == 0).
@@ -32,6 +35,12 @@ const schemaVersion = 1
 //     single searchable tokens so typed-prefix matching works on them.
 //   - content_fts    — standalone FTS5 table holding extracted text of
 //     allowlisted files (path is UNINDEXED payload, body is searched).
+//   - file_meta      — extracted embedded metadata (EXIF, stream layout, tags,
+//     package fields): several rows per (file_id, key) are legitimate (one
+//     per audio track, one per dependency). num is set for numerically
+//     comparable values. Rows are deleted with their file (explicitly in the
+//     sweeps, and by the FK cascade as a belt). The (key, value) index is
+//     NOCASE so "=" and prefix LIKE filters, both case-insensitive, use it.
 //   - meta           — key/value: crawl generation counter, last_full_scan.
 var schemaDDL = []string{
 	`CREATE TABLE files (
@@ -44,7 +53,8 @@ var schemaDDL = []string{
 		mtime           INTEGER NOT NULL DEFAULT 0,
 		mimeclass       TEXT NOT NULL DEFAULT '',
 		content_indexed INTEGER NOT NULL DEFAULT 0,
-		gen             INTEGER NOT NULL DEFAULT 0
+		gen             INTEGER NOT NULL DEFAULT 0,
+		meta_extracted  INTEGER NOT NULL DEFAULT 0
 	)`,
 	`CREATE INDEX files_dir_idx ON files(dir)`,
 	`CREATE INDEX files_ext_idx ON files(ext)`,
@@ -52,6 +62,7 @@ var schemaDDL = []string{
 	`CREATE INDEX files_mtime_idx ON files(mtime)`,
 	`CREATE INDEX files_gen_idx ON files(gen)`,
 	`CREATE INDEX files_ci_idx ON files(content_indexed)`,
+	`CREATE INDEX files_me_idx ON files(meta_extracted)`,
 	`CREATE VIRTUAL TABLE names_fts USING fts5(
 		name, dir,
 		content='files', content_rowid='id',
@@ -77,6 +88,31 @@ var schemaDDL = []string{
 		tokenize='unicode61'
 	)`,
 	`CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+	fileMetaDDL[0], fileMetaDDL[1], fileMetaDDL[2], fileMetaDDL[3],
+}
+
+// fileMetaDDL creates the embedded-metadata table; shared by the fresh
+// schema and the v1→v2 migration.
+var fileMetaDDL = []string{
+	`CREATE TABLE file_meta (
+		file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+		key     TEXT NOT NULL,
+		value   TEXT NOT NULL,
+		num     REAL
+	)`,
+	`CREATE INDEX idx_meta_key_value ON file_meta(key, value COLLATE NOCASE)`,
+	`CREATE INDEX idx_meta_key_num   ON file_meta(key, num)`,
+	`CREATE INDEX idx_meta_file      ON file_meta(file_id)`,
+}
+
+// migrations[v] upgrades a database at user_version v to v+1. Each runs in
+// one transaction and must preserve existing rows.
+var migrations = map[int][]string{
+	1: {
+		`ALTER TABLE files ADD COLUMN meta_extracted INTEGER NOT NULL DEFAULT 0`,
+		`CREATE INDEX files_me_idx ON files(meta_extracted)`,
+		fileMetaDDL[0], fileMetaDDL[1], fileMetaDDL[2], fileMetaDDL[3],
+	},
 }
 
 // openDB opens (creating if needed) the index database with the required
@@ -102,7 +138,8 @@ func openDB(path string) (*sql.DB, error) {
 	dsn := "file:" + path +
 		"?_pragma=busy_timeout(5000)" +
 		"&_pragma=journal_mode(WAL)" +
-		"&_pragma=synchronous(NORMAL)"
+		"&_pragma=synchronous(NORMAL)" +
+		"&_pragma=foreign_keys(1)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("index: open db: %w", err)
@@ -159,10 +196,42 @@ func migrate(db *sql.DB) error {
 			return fmt.Errorf("index: stamp schema version: %w", err)
 		}
 		return nil
-	default:
-		// Future incremental migrations slot in here (v1 -> v2 -> ...).
-		return fmt.Errorf("index: no migration path from schema version %d", v)
 	}
+	for v < schemaVersion {
+		steps, ok := migrations[v]
+		if !ok {
+			return fmt.Errorf("index: no migration path from schema version %d", v)
+		}
+		if err := applyMigration(db, v, steps); err != nil {
+			return err
+		}
+		v++
+	}
+	return nil
+}
+
+// applyMigration runs one version step atomically, stamping the new
+// user_version in the same transaction so a crash mid-way leaves the old
+// version (and the old schema) intact.
+func applyMigration(db *sql.DB, from int, steps []string) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("index: migrate v%d: %w", from, err)
+	}
+	defer tx.Rollback()
+	for _, ddl := range steps {
+		if _, err := tx.Exec(ddl); err != nil {
+			return fmt.Errorf("index: migrate v%d→v%d: %w (in %.60q)", from, from+1, err, ddl)
+		}
+	}
+	if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, from+1)); err != nil {
+		return fmt.Errorf("index: stamp schema version: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("index: migrate v%d: commit: %w", from, err)
+	}
+	log.Printf("index: migrated database schema v%d → v%d", from, from+1)
+	return nil
 }
 
 // --- meta helpers ---------------------------------------------------------

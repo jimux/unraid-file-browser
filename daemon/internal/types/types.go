@@ -57,7 +57,7 @@ type SearchHit struct {
 
 // SearchQuery carries the parsed parameters of GET /search.
 type SearchQuery struct {
-	Q       string // FTS-style query text
+	Q       string // FTS-style query text; optional when at least one filter is set
 	Mode    string // "name" | "content" | "both"
 	Path    string // scope prefix, "" = everywhere
 	Exts    []string
@@ -67,13 +67,71 @@ type SearchQuery struct {
 	Before  int64 // mtime upper bound, 0 = unset
 	Limit   int
 	Offset  int
+	// Meta filters are ANDed; see MetaFilter. Keys come from the catalog
+	// (GET /meta/fields): "video.hdr", "image.cameraModel", ... plus the
+	// common keys name, ext, size, mtime, mime.
+	Meta []MetaFilter
+	// Sort is "relevance" | "name" | "size" | "mtime"; "" = relevance when Q
+	// is set, else name. Dir is "asc" | "desc" ("" = asc, except relevance
+	// which is always best-first).
+	Sort string
+	Dir  string
+}
+
+// MetaFilter is one embedded-metadata predicate of a search. Op is one of
+// "=", "!=", "~" (case-insensitive substring), "<", "<=", ">", ">=". The
+// ordering operators apply to numeric fields only (number, bytes, date —
+// dates accept RFC3339 or unix seconds). "!=" means "no value of this key
+// equals Value", so a file with two audio tracks, one AC-3 and one AAC, does
+// NOT match video.audioCodec != ac3.
+type MetaFilter struct {
+	Key   string `json:"key"`
+	Op    string `json:"op"`
+	Value string `json:"value"`
+}
+
+// MetaValue is one distinct value of a metadata key with its file count
+// (GET /meta/values).
+type MetaValue struct {
+	Value string `json:"value"`
+	Count int64  `json:"count"`
+}
+
+// MetaCategory groups the searchable fields of one kind of file. Extensions
+// are lowercase without a dot; nil for the "common" category, whose fields
+// exist for every indexed file.
+type MetaCategory struct {
+	ID         string         `json:"id"`    // "common" | "image" | "video" | "audio" | "package"
+	Label      string         `json:"label"` // UI heading, e.g. "Video"
+	Extensions []string       `json:"extensions"`
+	Fields     []MetaFieldDef `json:"fields"`
+}
+
+// MetaFieldDef describes one searchable metadata key for the UI. Type is
+// "text" | "number" | "bytes" | "date" | "enum" | "bool". Unit is a display
+// hint for numbers ("mm", "px", "s", "bit/s", "Hz", ...). Values lists the
+// enum members (enum and bool types) with friendly labels to show verbatim.
+type MetaFieldDef struct {
+	Key    string          `json:"key"`
+	Label  string          `json:"label"`
+	Type   string          `json:"type"`
+	Unit   string          `json:"unit,omitempty"`
+	Values []MetaEnumValue `json:"values,omitempty"`
+}
+
+// MetaEnumValue is one member of an enum field: the stored value and its
+// display label.
+type MetaEnumValue struct {
+	Value string `json:"value"`
+	Label string `json:"label"`
 }
 
 // IndexStatus is the shape of GET /index/status and each SSE event.
 type IndexStatus struct {
-	State          string  `json:"state"` // "idle" | "crawling" | "extracting"
+	State          string  `json:"state"` // "idle" | "crawling" | "extracting" | "metadata"
 	FilesIndexed   int64   `json:"filesIndexed"`
 	ContentIndexed int64   `json:"contentIndexed"`
+	MetaIndexed    int64   `json:"metaIndexed"` // files with at least one extracted metadata field
 	DBBytes        int64   `json:"dbBytes"`
 	LastFullScan   int64   `json:"lastFullScan"` // unix seconds, 0 = never
 	Current        string  `json:"current,omitempty"`

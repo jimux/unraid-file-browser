@@ -23,6 +23,7 @@ import (
 	"unraid-filebrowser/internal/config"
 	"unraid-filebrowser/internal/fsops"
 	"unraid-filebrowser/internal/index"
+	"unraid-filebrowser/internal/meta"
 	"unraid-filebrowser/internal/transcode"
 	"unraid-filebrowser/internal/types"
 )
@@ -144,6 +145,24 @@ func (l *lazyIndex) SetConfig(cfg types.IndexConfig) error {
 
 func (l *lazyIndex) AllowedRoots() []string { return l.roots }
 
+// MetaFields is answerable before the database opens: the catalog is static,
+// compiled into the daemon, so the search UI can render its dropdowns while
+// the index is still starting. Values, which are read out of the database,
+// cannot be.
+func (l *lazyIndex) MetaFields() []types.MetaCategory {
+	if p := l.ready.Load(); p != nil {
+		return p.MetaFields()
+	}
+	return meta.Catalog()
+}
+
+func (l *lazyIndex) MetaValues(ctx context.Context, key, prefix, pathScope string, limit int) ([]types.MetaValue, error) {
+	if p := l.ready.Load(); p != nil {
+		return p.MetaValues(ctx, key, prefix, pathScope, limit)
+	}
+	return nil, errStarting
+}
+
 func (l *lazyIndex) Rescan(path string) error {
 	if p := l.ready.Load(); p != nil {
 		return p.Rescan(path)
@@ -161,6 +180,22 @@ func (l *lazyIndex) Resume() {
 	if p := l.ready.Load(); p != nil {
 		p.Resume()
 	}
+}
+
+// anyWithin reports whether at least one candidate lies at or beneath one of
+// the roots, using whole-path-element matching so /mnt/userX is not "within"
+// /mnt/user.
+func anyWithin(candidates, roots []string) bool {
+	for _, c := range candidates {
+		c = filepath.Clean(c)
+		for _, r := range roots {
+			r = filepath.Clean(r)
+			if c == r || r == "/" || strings.HasPrefix(c, strings.TrimSuffix(r, "/")+string(filepath.Separator)) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // parseRoots validates the -roots flag: absolute, cleaned, non-empty paths.
@@ -230,7 +265,11 @@ func run(dev bool, listen, socket, dataDir, rootList string, rootOverride bool) 
 	// Index roots are API-settable and therefore untrusted; the index package
 	// rejects anything outside the browse roots. A fresh install (or a dev
 	// -root override) starts with index roots == browse roots.
-	if rootOverride || len(cfg.Index.Roots) == 0 {
+	// Index roots must lie inside the browse roots or the index layer drops
+	// them. If that would leave nothing to crawl -- a fresh install whose
+	// default root is /mnt/user while -roots names something narrower -- fall
+	// back to the browse roots instead of silently indexing nothing.
+	if rootOverride || len(cfg.Index.Roots) == 0 || !anyWithin(cfg.Index.Roots, browseRoots) {
 		cfg.Index.Roots = append([]string(nil), browseRoots...)
 	}
 
@@ -276,7 +315,12 @@ func run(dev bool, listen, socket, dataDir, rootList string, rootOverride bool) 
 		// Opening the index can take a minute on a cold array; do it behind the
 		// listener so browsing, viewing and playback are available immediately.
 		go func() {
-			idx, err := index.New(filepath.Join(dataDir, "index.db"), cfg.Index, index.Options{AllowedRoots: browseRoots})
+			// FFprobePath is what enables video (and richer audio) metadata
+			// extraction; without it those categories stay silently empty.
+			idx, err := index.New(filepath.Join(dataDir, "index.db"), cfg.Index, index.Options{
+				AllowedRoots: browseRoots,
+				FFprobePath:  media.Capabilities().FFprobePath,
+			})
 			if err != nil {
 				log.Printf("warning: index unavailable: %v", err)
 				return

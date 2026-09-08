@@ -56,6 +56,12 @@ type ArchiveFS interface {
 // IndexService is the search index (internal/index).
 type IndexService interface {
 	Search(ctx context.Context, q types.SearchQuery) ([]types.SearchHit, int, error)
+	// MetaFields is the metadata vocabulary behind /search/fields: the
+	// categories, their fields and any enumerated values. Static per build.
+	MetaFields() []types.MetaCategory
+	// MetaValues lists the distinct values recorded for one metadata key,
+	// optionally narrowed by a value prefix (type-ahead) and a path scope.
+	MetaValues(ctx context.Context, key, prefix, pathScope string, limit int) ([]types.MetaValue, error)
 	Status() types.IndexStatus
 	Subscribe() (<-chan types.IndexStatus, func())
 	Config() types.IndexConfig
@@ -134,6 +140,8 @@ func newRouter(s *server) http.Handler {
 		{http.MethodGet, base + "/fs/raw", s.fsRaw},
 		{http.MethodGet, base + "/encodings", s.wrap(s.encodings)},
 		{http.MethodGet, base + "/search", s.wrap(s.limited(s.search))},
+		{http.MethodGet, base + "/search/fields", s.wrap(s.searchFields)},
+		{http.MethodGet, base + "/search/values", s.wrap(s.limited(s.searchValues))},
 		{http.MethodGet, base + "/index/status", s.wrap(s.indexStatus)},
 		{http.MethodGet, base + "/index/events", s.indexEvents},
 		{http.MethodGet, base + "/index/config", s.wrap(s.indexGetConfig)},

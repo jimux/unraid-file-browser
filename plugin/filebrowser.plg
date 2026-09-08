@@ -26,6 +26,13 @@
 <CHANGES>
 ##File Browser
 
+###2026.09.09
+- Search by embedded metadata: photos by camera body, lens, ISO or date taken (JPEG, HEIC and raw incl. Panasonic RW2, CR2/CR3, NEF, ARW, DNG); video by HDR format, codec, resolution or audio track (Dolby Digital, E-AC-3, TrueHD, DTS); audio by artist, album, year or genre; deb and rpm packages by name, version, arch or dependency
+- Search is no longer live-as-you-type: press Search or Enter. Better for spinning disks, and results no longer churn while you build a query
+- Searches can now run on filters alone, with no query text -- "files bigger than 20 GB" is a search on its own
+- New condition builder: pick a category, then a field, then an operator and value. Value dropdowns list what is actually in your index. Type-specific categories pre-filter by file extension, with a checkbox to search every file instead
+- Metadata is extracted during the nightly crawl for files whose extension matches a known type; everything else is skipped
+
 ###2026.09.08b
 - Fix: transcoding, Settings save and Rescan silently failed on Unraid 7.2.0 and earlier. The webGUI's CSRF check reads the token only from form fields, so our JSON POSTs were rejected before the plugin ran, by an exit() that emits no body -- which arrives as an empty HTTP 200 and surfaced as "unexpected response shape". Requests now carry the token in a form envelope that every Unraid version accepts
 - Fix: the bridge never emits a 2xx whose body is not what the daemon sent; a truncated or unlabelable response is reported as an error envelope instead

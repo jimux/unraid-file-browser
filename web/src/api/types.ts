@@ -190,6 +190,66 @@ export interface SearchResult {
   tookMs: number;
 }
 
+/* ------------------------------------------------- searchable metadata schema */
+
+/**
+ * How a metadata field is edited and compared. The daemon owns this — the SPA
+ * never hard-codes a field, only the editor for each of these six shapes.
+ */
+export type SearchFieldType = "text" | "number" | "bytes" | "date" | "enum" | "bool";
+
+/** One choice of an `enum` field: the user sees `label`, the wire gets `value`. */
+export interface SearchFieldValue {
+  value: string;
+  label: string;
+}
+
+export interface SearchField {
+  /** Wire key, e.g. "image.cameraModel". Also the `key` for /search/values. */
+  key: string;
+  label: string;
+  type: SearchFieldType;
+  /** Suffix shown after a `number` input, e.g. "px", "kbps". */
+  unit?: string;
+  /** Present for `enum`; when absent the UI falls back to /search/values. */
+  values?: SearchFieldValue[];
+}
+
+/**
+ * A group of fields in the cascading picker.
+ *
+ * `extensions` is the default extension pre-filter for a *type-specific*
+ * category (image/video/audio/package); it is `null` for the always-present
+ * `common` category, which applies to every file.
+ */
+export interface SearchCategory {
+  id: string;
+  label: string;
+  extensions: string[] | null;
+  fields: SearchField[];
+}
+
+export interface SearchFieldsResult {
+  categories: SearchCategory[];
+}
+
+/** One distinct value actually present in the index, with its hit count. */
+export interface SearchValueCount {
+  value: string;
+  count: number;
+}
+
+export interface SearchValuesResult {
+  values: SearchValueCount[];
+}
+
+export interface SearchValuesParams {
+  key: string;
+  prefix?: string;
+  path?: string;
+  limit?: number;
+}
+
 /**
  * GET and PUT /index/config both return this shape.
  *
@@ -218,6 +278,9 @@ export type SortKey = "name" | "size" | "mtime" | "type";
 export type SortDir = "asc" | "desc";
 export type SearchMode = "name" | "content" | "both";
 
+/** `relevance` is only meaningful when the request carries a `q`. */
+export type SearchSort = "relevance" | "name" | "size" | "mtime";
+
 export interface ListParams {
   path: string;
   offset?: number;
@@ -240,8 +303,13 @@ export interface HexParams {
   length?: number;
 }
 
+/**
+ * `q` is optional: a request with no `q` but at least one filter
+ * (path/ext/size/date/meta) is a valid metadata-only search. Both empty is a
+ * BAD_REQUEST, which is why the SPA's Search button refuses to fire on it.
+ */
 export interface SearchParams {
-  q: string;
+  q?: string;
   mode?: SearchMode;
   path?: string;
   ext?: string;
@@ -249,6 +317,10 @@ export interface SearchParams {
   maxSize?: number;
   after?: number;
   before?: number;
+  /** Repeated `meta=<key><op><value>`; ops = != ~ < <= > >=. ANDed together. */
+  meta?: string[];
+  sort?: SearchSort;
+  dir?: SortDir;
   limit?: number;
   offset?: number;
 }

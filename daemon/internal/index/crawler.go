@@ -36,7 +36,8 @@ type extractResult struct {
 
 // runCrawl performs one crawl: a single-threaded metadata walk (stat only),
 // a scoped mark-and-sweep of vanished rows, then — when content indexing is
-// enabled — a parallel content-extraction pass. scope == "" means all
+// enabled — a parallel content-extraction pass, then the embedded-metadata
+// pass over new/changed media and package files. scope == "" means all
 // configured roots (a "full" scan, which also stamps LastFullScan).
 func (s *Service) runCrawl(ctx context.Context, scope string) {
 	cfg := s.Config()
@@ -96,6 +97,13 @@ func (s *Service) runCrawl(ctx context.Context, scope string) {
 		s.contentPass(ctx, cfg, roots)
 	}
 
+	if len(s.metaExts) > 0 && ctx.Err() == nil {
+		s.state.Store(stateMetadata)
+		s.setProgress(0)
+		s.notify(true)
+		s.metaPass(ctx, cfg, roots)
+	}
+
 	if full && ctx.Err() == nil {
 		now := time.Now().Unix()
 		if err := s.setMeta(ctx, "last_full_scan", strconv.FormatInt(now, 10)); err == nil {
@@ -114,17 +122,20 @@ func (s *Service) countInScope(ctx context.Context, roots []string) int64 {
 }
 
 // upsertSQL stamps the new generation on every seen row. When size+mtime are
-// unchanged the row's content_indexed state is preserved (no re-extraction);
-// when they changed it is reset to 0 so the content pass picks the file up
-// again. It never touches name/dir, so the names_fts update trigger
-// (UPDATE OF name, dir) does not fire and the FTS index is not churned.
+// unchanged the row's content_indexed and meta_extracted states are
+// preserved (no re-extraction); when they changed both are reset to 0 so
+// the content and metadata passes pick the file up again. It never touches
+// name/dir, so the names_fts update trigger (UPDATE OF name, dir) does not
+// fire and the FTS index is not churned.
 const upsertSQL = `
-INSERT INTO files (path, dir, name, ext, size, mtime, mimeclass, content_indexed, gen)
-VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+INSERT INTO files (path, dir, name, ext, size, mtime, mimeclass, content_indexed, meta_extracted, gen)
+VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
 ON CONFLICT(path) DO UPDATE SET
 	gen             = excluded.gen,
 	content_indexed = CASE WHEN files.size = excluded.size AND files.mtime = excluded.mtime
 	                       THEN files.content_indexed ELSE 0 END,
+	meta_extracted  = CASE WHEN files.size = excluded.size AND files.mtime = excluded.mtime
+	                       THEN files.meta_extracted ELSE 0 END,
 	size            = excluded.size,
 	mtime           = excluded.mtime,
 	mimeclass       = excluded.mimeclass`
@@ -229,13 +240,18 @@ func (s *Service) flushBatch(ctx context.Context, batch []fileRec, gen int64) er
 
 // sweep deletes rows inside the crawled scope that the walk did not stamp
 // with the current generation (mark-and-sweep): those files no longer exist.
-// Their content_fts documents are removed first.
+// Their content_fts documents and file_meta rows are removed first.
 func (s *Service) sweep(ctx context.Context, roots []string, gen int64) {
 	cond, args := prefixCond("path", roots)
 	if _, err := s.db.ExecContext(ctx,
 		`DELETE FROM content_fts WHERE path IN (SELECT path FROM files WHERE gen < ? AND `+cond+`)`,
 		append([]any{gen}, args...)...); err != nil {
 		log.Printf("index: content sweep failed: %v", err)
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`DELETE FROM file_meta WHERE file_id IN (SELECT id FROM files WHERE gen < ? AND `+cond+`)`,
+		append([]any{gen}, args...)...); err != nil {
+		log.Printf("index: metadata sweep failed: %v", err)
 	}
 	if _, err := s.db.ExecContext(ctx,
 		`DELETE FROM files WHERE gen < ? AND `+cond, append([]any{gen}, args...)...); err != nil {

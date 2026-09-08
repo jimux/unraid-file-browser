@@ -14,8 +14,13 @@ import type {
   MediaProbe,
   MediaSession,
   MediaSessionParams,
+  SearchCategory,
+  SearchFieldsResult,
   SearchParams,
   SearchResult,
+  SearchValueCount,
+  SearchValuesParams,
+  SearchValuesResult,
   StatResult,
   ViewParams,
   ViewResult,
@@ -327,9 +332,17 @@ export function hlsPath(sessionId: string, name: string): string | null {
 
 /* ------------------------------------------------------------------ search */
 
-export function search(p: SearchParams, signal?: AbortSignal): Promise<SearchResult> {
-  return request<SearchResult>(
-    `/search${qs({
+/**
+ * `meta` is the one repeated parameter in the API, so it cannot go through
+ * `qs()` (a Record cannot hold two `meta` keys). Everything else keeps the
+ * drop-empty semantics of `qs`; the meta triples are appended after it, in
+ * order, so the query string a given form produces is byte-stable — the search
+ * view compares it against the last query it actually ran to decide whether the
+ * results on screen are stale.
+ */
+export function searchQuery(p: SearchParams): string {
+  const sp = new URLSearchParams(
+    qs({
       q: p.q,
       mode: p.mode,
       path: p.path,
@@ -338,11 +351,55 @@ export function search(p: SearchParams, signal?: AbortSignal): Promise<SearchRes
       maxSize: p.maxSize,
       after: p.after,
       before: p.before,
+      sort: p.sort,
+      dir: p.dir,
       limit: p.limit,
       offset: p.offset,
-    })}`,
-    { signal },
+    }).replace(/^\?/, ""),
   );
+  for (const m of p.meta ?? []) if (m) sp.append("meta", m);
+  return sp.toString();
+}
+
+export function search(p: SearchParams, signal?: AbortSignal): Promise<SearchResult> {
+  const s = searchQuery(p);
+  return request<SearchResult>(`/search${s ? `?${s}` : ""}`, { signal }).then((r) => ({
+    ...r,
+    // Go marshals an empty slice as null; never let one reach .map().
+    hits: Array.isArray(r?.hits) ? r.hits : [],
+  }));
+}
+
+/**
+ * The metadata schema behind the cascading condition rows. Fetched once per
+ * mount of the search view; a daemon that does not implement it yet answers
+ * NOT_FOUND, and the view degrades to the common fields it can name itself.
+ */
+export function searchFields(signal?: AbortSignal): Promise<SearchCategory[]> {
+  return request<SearchFieldsResult>("/search/fields", { signal }).then((d) =>
+    (Array.isArray(d?.categories) ? d.categories : []).map((c) => ({
+      id: String(c?.id ?? ""),
+      label: String(c?.label ?? c?.id ?? ""),
+      extensions: Array.isArray(c?.extensions) ? c.extensions.filter(Boolean).map((e) => String(e)) : null,
+      fields: (Array.isArray(c?.fields) ? c.fields : []).map((f) => ({
+        key: String(f?.key ?? ""),
+        label: String(f?.label ?? f?.key ?? ""),
+        type: f?.type ?? "text",
+        unit: f?.unit,
+        values: Array.isArray(f?.values)
+          ? f.values.map((v) => ({ value: String(v?.value ?? ""), label: String(v?.label ?? v?.value ?? "") }))
+          : undefined,
+      })),
+    })),
+  );
+}
+
+/** Distinct values actually present in the index, for a value dropdown. */
+export function searchValues(p: SearchValuesParams, signal?: AbortSignal): Promise<SearchValueCount[]> {
+  return request<SearchValuesResult>(
+    `/search/values${qs({ key: p.key, prefix: p.prefix, path: p.path, limit: p.limit })}`,
+    { signal },
+  ).then((d) => (Array.isArray(d?.values) ? d.values : []));
 }
 
 /* ------------------------------------------------------------------- index */

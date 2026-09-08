@@ -15,13 +15,15 @@ import (
 
 	"github.com/robfig/cron/v3"
 
+	"unraid-filebrowser/internal/meta"
 	"unraid-filebrowser/internal/types"
 )
 
 const (
 	stateIdle       = "idle"
 	stateCrawling   = "crawling"
-	stateExtracting = "extracting"
+	stateExtracting = "extracting" // content (full-text) pass
+	stateMetadata   = "metadata"   // embedded-metadata pass
 
 	defaultParallelism  = 2
 	defaultMaxFileBytes = 10 * 1024 * 1024
@@ -45,6 +47,12 @@ type Options struct {
 	// index root and content include-path must be equal to or beneath one of
 	// them. Required (empty → error).
 	AllowedRoots []string
+
+	// FFprobePath enables ffprobe-backed metadata extraction (video streams;
+	// audio bitrate/duration). Empty disables it: video files then get no
+	// embedded metadata and music files only what their tags carry. Comes
+	// from transcode.Discover() at boot, never from the API.
+	FFprobePath string
 }
 
 // Service owns the search index: the SQLite/FTS5 store, the crawler that
@@ -68,15 +76,23 @@ type Service struct {
 	skipDirFn     func(name, path string) bool
 	contentExtsFn func() []string
 
+	// Embedded-metadata extractors (internal/meta), indexed by extension.
+	// metaExts is the sorted extension list used as the crawl's candidate
+	// filter; an empty set disables the metadata pass entirely.
+	extractors map[string]meta.Extractor
+	metaExts   []string
+
 	// Live status. Kept in atomics so Status() answers instantly and never
 	// contends with the crawl.
-	state          atomic.Value // string: idle|crawling|extracting
+	state          atomic.Value // string: idle|crawling|extracting|metadata
 	current        atomic.Value // string: path being processed
 	progressBits   atomic.Uint64
 	filesIndexed   atomic.Int64
 	contentIndexed atomic.Int64
+	metaIndexed    atomic.Int64 // files with at least one file_meta row
 	lastFullScan   atomic.Int64
 	extracted      atomic.Int64 // lifetime count of content extractions (metrics/tests)
+	metaExtracted  atomic.Int64 // lifetime count of metadata extraction attempts (tests)
 
 	// Single-flight crawl.
 	crawlBusy   atomic.Bool
@@ -123,6 +139,7 @@ func New(dbPath string, cfg types.IndexConfig, opts Options) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
+	exs := meta.Extractors(opts.FFprobePath)
 	s := &Service{
 		db:            db,
 		dbPath:        dbPath,
@@ -130,6 +147,8 @@ func New(dbPath string, cfg types.IndexConfig, opts Options) (*Service, error) {
 		cfg:           copyConfig(cfg),
 		skipDirFn:     SkipDir,
 		contentExtsFn: DefaultContentExtensions,
+		extractors:    meta.ByExtension(exs),
+		metaExts:      meta.AllExtensions(exs),
 		subs:          make(map[int]chan types.IndexStatus),
 	}
 	s.state.Store(stateIdle)
@@ -185,6 +204,7 @@ func (s *Service) Status() types.IndexStatus {
 		State:          s.state.Load().(string),
 		FilesIndexed:   s.filesIndexed.Load(),
 		ContentIndexed: s.contentIndexed.Load(),
+		MetaIndexed:    s.metaIndexed.Load(),
 		DBBytes:        s.dbBytes(),
 		LastFullScan:   s.lastFullScan.Load(),
 	}
@@ -236,8 +256,8 @@ func (s *Service) Config() types.IndexConfig {
 // parallelism must be 1..16 and content.maxFileBytes 1..64 MiB; violations
 // return *types.APIError with ErrBadRequest and a message naming the field.
 // Rows indexed under roots (or include paths) the new configuration no
-// longer covers are deleted from files, names_fts and content_fts in one
-// transaction. If the scheduler is running it is rebuilt with the new cron
+// longer covers are deleted from files, names_fts, content_fts and file_meta
+// in one transaction. If the scheduler is running it is rebuilt with the new cron
 // schedule.
 func (s *Service) SetConfig(cfg types.IndexConfig) error {
 	if s.closed.Load() {
@@ -543,6 +563,10 @@ func (s *Service) sweepOutsideRoots(ctx context.Context) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM content_fts WHERE NOT `+rootCond, rootArgs...); err != nil {
 		return err
 	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM file_meta WHERE file_id IN (SELECT id FROM files WHERE NOT `+rootCond+`)`, rootArgs...); err != nil {
+		return err
+	}
 	if len(cfg.Content.IncludePaths) > 0 {
 		incCond, incArgs := prefixCond("path", cfg.Content.IncludePaths)
 		if _, err := tx.ExecContext(ctx, `DELETE FROM content_fts WHERE NOT `+incCond, incArgs...); err != nil {
@@ -600,6 +624,9 @@ func (s *Service) recount(ctx context.Context) {
 	}
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM content_fts`).Scan(&n); err == nil {
 		s.contentIndexed.Store(n)
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(DISTINCT file_id) FROM file_meta`).Scan(&n); err == nil {
+		s.metaIndexed.Store(n)
 	}
 }
 

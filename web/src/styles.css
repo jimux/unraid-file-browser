@@ -1153,6 +1153,103 @@ mark {
   flex-wrap: wrap;
 }
 
+.search-go .btn {
+  gap: 5px;
+  padding: 0 12px;
+}
+
+/* The un-run state has to be unmissable: results on screen are from the
+   previous query until this is pressed. */
+.search-btn.is-dirty {
+  box-shadow: 0 0 0 2px var(--accent-soft);
+  animation: search-dirty-pulse 1.6s ease-in-out infinite;
+}
+@keyframes search-dirty-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 2px var(--accent-soft);
+  }
+  50% {
+    box-shadow: 0 0 0 4px var(--accent-soft);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .search-btn.is-dirty {
+    animation: none;
+  }
+}
+
+/* ------------------------------------------------------- condition builder */
+
+.search-conds {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.search-cond {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.cond-join {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-faint);
+  min-width: 42px;
+}
+.cond-op {
+  min-width: 76px;
+}
+.cond-remove {
+  font-size: 15px;
+  line-height: 1;
+  color: var(--text-muted);
+}
+.search-cond-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+}
+.unit-label {
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.ext-prefilter {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 11.5px;
+  padding: 4px 0 0 48px;
+}
+.ext-prefilter .check-field {
+  display: inline-flex;
+}
+.ext-prefilter .muted {
+  font-size: 11px;
+}
+.ext-list {
+  flex-basis: 100%;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  word-break: break-word;
+}
+.link-btn {
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  font-size: 11.5px;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+}
+
 .search-status {
   display: flex;
   align-items: center;

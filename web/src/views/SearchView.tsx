@@ -1,79 +1,64 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ApiError, search as apiSearch } from "../api/client";
-import type { Entry, SearchMode, SearchResult } from "../api/types";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  ApiError,
+  search as apiSearch,
+  searchFields,
+  searchQuery,
+  searchValues,
+} from "../api/client";
+import type {
+  Entry,
+  SearchCategory,
+  SearchField,
+  SearchMode,
+  SearchParams,
+  SearchResult,
+  SearchSort,
+  SearchValueCount,
+  SortDir,
+} from "../api/types";
 import { EmptyState, ErrorBanner, SkeletonRows, Spinner } from "../components/Feedback";
 import { EntryIcon, Icon } from "../components/Icon";
 import { ContextMenu, isMenuKey, useContextMenu } from "../components/ContextMenu";
-import { useDebounced } from "../hooks/useAsync";
 import { formatAbsolute, formatRelative, formatSize } from "../lib/format";
 import { buildEntryMenu } from "../lib/entryMenu";
 import { dirOf } from "../lib/paths";
 import { SETTINGS_HREF, navigate, searchHref, syncUrlSilently, viewHref } from "../lib/router";
 import { sanitizeSnippet } from "../lib/sanitize";
+import {
+  BYTE_UNITS,
+  DEFAULT_BYTE_UNIT,
+  FALLBACK_CATEGORIES,
+  OPS,
+  buildSearchParams,
+  canSearch,
+  defaultOp,
+  effectiveSort,
+  findCategory,
+  findField,
+  MAX_CONDS,
+  newCond,
+  parseSearchForm,
+  preFilterExtensions,
+  typeCategoriesInUse,
+  type Cond,
+  type SearchForm,
+} from "../lib/searchQuery";
 
 const PAGE = 100;
 
 /** Hard byte-ish ceiling on one result snippet before sanitising/rendering. */
 const SNIPPET_CHARS = 4096;
 
-const SIZE_UNITS: Array<{ id: string; label: string; mult: number }> = [
-  { id: "B", label: "B", mult: 1 },
-  { id: "KiB", label: "KiB", mult: 1024 },
-  { id: "MiB", label: "MiB", mult: 1024 ** 2 },
-  { id: "GiB", label: "GiB", mult: 1024 ** 3 },
-];
+/** How many extensions the pre-filter label names before it says "…". */
+const EXT_PREVIEW = 4;
 
-interface FormState {
-  q: string;
-  mode: SearchMode;
-  scope: string;
-  everywhere: boolean;
-  ext: string;
-  minSize: string;
-  minUnit: string;
-  maxSize: string;
-  maxUnit: string;
-  after: string; // yyyy-mm-dd
-  before: string;
-}
-
-function initialForm(params: URLSearchParams, currentDir: string): FormState {
-  const scopeParam = params.get("path");
-  return {
-    q: params.get("q") ?? "",
-    mode: (params.get("mode") as SearchMode) || "both",
-    scope: scopeParam ?? currentDir,
-    everywhere: params.has("path") ? !scopeParam : !currentDir,
-    ext: params.get("ext") ?? "",
-    minSize: params.get("minSize") ? String(Number(params.get("minSize"))) : "",
-    minUnit: "B",
-    maxSize: params.get("maxSize") ? String(Number(params.get("maxSize"))) : "",
-    maxUnit: "B",
-    after: unixToDateInput(params.get("after")),
-    before: unixToDateInput(params.get("before")),
-  };
-}
-
-function unixToDateInput(v: string | null): string {
-  if (!v) return "";
-  const n = Number(v);
-  if (!Number.isFinite(n) || n <= 0) return "";
-  const d = new Date(n * 1000);
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-}
-
-function dateInputToUnix(v: string, endOfDay: boolean): number | undefined {
-  if (!v) return undefined;
-  const t = Date.parse(endOfDay ? `${v}T23:59:59` : `${v}T00:00:00`);
-  return Number.isNaN(t) ? undefined : Math.floor(t / 1000);
-}
-
-function bytesOf(value: string, unit: string): number | undefined {
-  if (!value.trim()) return undefined;
-  const n = Number(value);
-  if (!Number.isFinite(n) || n < 0) return undefined;
-  const u = SIZE_UNITS.find((s) => s.id === unit) ?? SIZE_UNITS[0];
-  return Math.round(n * u.mult);
+/** One search that has actually been issued: its wire query and its params. */
+interface RunState {
+  key: string;
+  params: SearchParams;
+  /** Bumped by a re-run of an unchanged query, so the effect refires. */
+  nonce: number;
 }
 
 export function SearchView({
@@ -87,95 +72,84 @@ export function SearchView({
   onNavigate: (p: string) => void;
   onOpenFile: (p: string, mime?: string, name?: string) => void;
 }) {
-  const [form, setForm] = useState<FormState>(() => initialForm(params, currentDir));
+  const [cats, setCats] = useState<SearchCategory[] | null>(null);
+  const [form, setForm] = useState<SearchForm | null>(null);
+  const [run, setRun] = useState<RunState | null>(null);
   const [result, setResult] = useState<SearchResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<ApiError | null>(null);
   const [offset, setOffset] = useState(0);
+  const [extOpen, setExtOpen] = useState(false);
   const { menu, openAt, openAtElement, close: closeMenu } = useContextMenu<Entry>();
 
   /**
-   * The results have no sort of their own (relevance order is not something
-   * `fs/list` can reproduce), so the player gets the daemon's name/asc default
-   * for its ↑/↓ — the same thing a click on the hit name already does.
+   * The metadata schema, once, at mount. The form cannot be parsed out of the
+   * URL before it arrives — a `meta=image.cameraModel=…` triple is only
+   * editable if we know which category and which type that key belongs to —
+   * so hydration, and the auto-run of a bookmarked search, both wait for it.
+   *
+   * Deriving the first run from the *hydrated form* rather than from the URL
+   * verbatim is what keeps the "unrun changes" indicator honest: the query we
+   * ran is by construction the query the form describes.
    */
-  const openHit = useCallback(
-    (e: Entry) => (e.type === "dir" || e.type === "archive" ? onNavigate(e.path) : onOpenFile(e.path, e.mime, e.name)),
-    [onNavigate, onOpenFile],
+  useEffect(() => {
+    const ac = new AbortController();
+    let alive = true;
+    searchFields(ac.signal)
+      .catch((e: unknown) => {
+        if (e instanceof DOMException && e.name === "AbortError") throw e;
+        return FALLBACK_CATEGORIES; // older daemon: degrade, do not break
+      })
+      .then((cs) => {
+        if (!alive) return;
+        const list = cs.length ? cs : FALLBACK_CATEGORIES;
+        const f = parseSearchForm(params, list, currentDir);
+        setCats(list);
+        setForm(f);
+        if (canSearch(f, list)) {
+          const p = buildSearchParams(f, list);
+          setRun({ key: searchQuery(p), params: p, nonce: 0 });
+        }
+      })
+      .catch(() => {
+        /* aborted */
+      });
+    return () => {
+      alive = false;
+      ac.abort();
+    };
+    // Mount-only: App remounts this view (keyed on the hash query) when the
+    // route changes, so `params` is frozen for the lifetime of the component.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /** The query the form currently describes — compared against the one we ran. */
+  const wireKey = useMemo(
+    () => (form && cats ? searchQuery(buildSearchParams(form, cats)) : ""),
+    [form, cats],
   );
 
-  const menuItems = useMemo(
-    () =>
-      menu ? buildEntryMenu(menu.target, { open: openHit, details: (e) => navigate(viewHref(e.path)) }) : [],
-    [menu, openHit],
-  );
+  const runnable = !!form && !!cats && canSearch(form, cats);
+  const dirty = !!run && !!form && wireKey !== run.key;
 
-  const set = <K extends keyof FormState>(k: K, v: FormState[K]) =>
-    setForm((f) => ({ ...f, [k]: v }));
+  const doSearch = useCallback(() => {
+    if (!form || !cats || !canSearch(form, cats)) return;
+    const p = buildSearchParams(form, cats);
+    setOffset(0);
+    setRun((r) => ({ key: searchQuery(p), params: p, nonce: (r?.nonce ?? 0) + 1 }));
+  }, [form, cats]);
 
-  const debounced = useDebounced(form, 300);
-
-  // Debounced query params, memoised so the fetch effect keys off a string.
-  const query = useMemo(() => {
-    const f = debounced;
-    const sp = new URLSearchParams();
-    if (f.q.trim()) sp.set("q", f.q.trim());
-    sp.set("mode", f.mode);
-    if (!f.everywhere && f.scope.trim()) sp.set("path", f.scope.trim());
-    if (f.ext.trim()) sp.set("ext", normaliseExts(f.ext));
-    const min = bytesOf(f.minSize, f.minUnit);
-    const max = bytesOf(f.maxSize, f.maxUnit);
-    if (min !== undefined) sp.set("minSize", String(min));
-    if (max !== undefined) sp.set("maxSize", String(max));
-    const after = dateInputToUnix(f.after, false);
-    const before = dateInputToUnix(f.before, true);
-    if (after !== undefined) sp.set("after", String(after));
-    if (before !== undefined) sp.set("before", String(before));
-    return sp;
-  }, [debounced]);
-
-  const queryKey = query.toString();
-
-  // Reset paging whenever the query itself changes.
-  const lastKeyRef = useRef(queryKey);
+  /**
+   * The only place a `/search` request is made. It keys off `run`, which only
+   * `doSearch` (and the bookmark hydration above) ever sets — editing the form
+   * changes nothing here, which is the whole point on a spinning-rust array.
+   */
   useEffect(() => {
-    if (lastKeyRef.current !== queryKey) {
-      lastKeyRef.current = queryKey;
-      setOffset(0);
-    }
-  }, [queryKey]);
-
-  // Keep the address bar shareable without remounting on every keystroke.
-  useEffect(() => {
-    syncUrlSilently(searchHref(queryKey));
-  }, [queryKey]);
-
-  useEffect(() => {
-    const q = query.get("q");
-    if (!q) {
-      setResult(null);
-      setError(null);
-      setLoading(false);
-      return;
-    }
+    if (!run?.key) return;
     const ac = new AbortController();
     let alive = true;
     setLoading(true);
-    apiSearch(
-      {
-        q,
-        mode: (query.get("mode") as SearchMode) || "both",
-        path: query.get("path") ?? undefined,
-        ext: query.get("ext") ?? undefined,
-        minSize: numOrUndef(query.get("minSize")),
-        maxSize: numOrUndef(query.get("maxSize")),
-        after: numOrUndef(query.get("after")),
-        before: numOrUndef(query.get("before")),
-        limit: PAGE,
-        offset,
-      },
-      ac.signal,
-    )
+    apiSearch({ ...run.params, limit: PAGE, offset }, ac.signal)
       .then((r) => {
         if (!alive) return;
         setResult(r);
@@ -185,14 +159,70 @@ export function SearchView({
         if (!alive) return;
         if (e instanceof DOMException && e.name === "AbortError") return;
         setError(e instanceof ApiError ? e : new ApiError("INTERNAL", String(e)));
-        setResult(null);
+        // Results stay on screen: the banner says the *new* search failed, and
+        // wiping the old hits would throw away the only thing still useful.
       })
       .finally(() => alive && setLoading(false));
     return () => {
       alive = false;
       ac.abort();
     };
-  }, [queryKey, offset]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [run, offset]);
+
+  // Keep the address bar on the query we actually ran, so a bookmark reproduces
+  // these results. Silent, so it never remounts the view mid-search.
+  useEffect(() => {
+    if (run?.key) syncUrlSilently(searchHref(run.key));
+  }, [run?.key]);
+
+  const setField = useCallback(<K extends keyof SearchForm>(k: K, v: SearchForm[K]) => {
+    setForm((f) => (f ? { ...f, [k]: v } : f));
+  }, []);
+
+  const updateCond = useCallback((c: Cond) => {
+    setForm((f) => (f ? { ...f, conds: f.conds.map((x) => (x.id === c.id ? c : x)) } : f));
+  }, []);
+
+  const removeCond = useCallback((id: number) => {
+    setForm((f) => (f ? { ...f, conds: f.conds.filter((x) => x.id !== id) } : f));
+  }, []);
+
+  const addCond = useCallback(() => {
+    setForm((f) =>
+      f && cats?.length && f.conds.length < MAX_CONDS ? { ...f, conds: [...f.conds, newCond(cats[0].id)] } : f,
+    );
+  }, [cats]);
+
+  /**
+   * The results have no sort of their own that `fs/list` could reproduce, so
+   * the player gets the daemon's name/asc default for its ↑/↓ — the same thing
+   * a click on the hit name already does.
+   */
+  const openHit = useCallback(
+    (e: Entry) => (e.type === "dir" || e.type === "archive" ? onNavigate(e.path) : onOpenFile(e.path, e.mime, e.name)),
+    [onNavigate, onOpenFile],
+  );
+
+  const menuItems = useMemo(
+    () => (menu ? buildEntryMenu(menu.target, { open: openHit, details: (e) => navigate(viewHref(e.path)) }) : []),
+    [menu, openHit],
+  );
+
+  if (!form || !cats) {
+    return (
+      <section className="search" aria-label="Search">
+        <div className="search-form">
+          <Spinner label="loading searchable fields…" />
+        </div>
+      </section>
+    );
+  }
+
+  const hasQ = !!form.q.trim();
+  const typeCats = typeCategoriesInUse(form, cats);
+  const allPreExts = preFilterExtensions({ ...form, extFilter: true }, cats);
+  const typeNames = typeCats.map((c) => c.label.toLowerCase()).join(" or ");
+  const scopeForValues = form.everywhere ? "" : form.scope.trim();
 
   const nowSec = Date.now() / 1000;
   const hits = result?.hits ?? [];
@@ -200,26 +230,59 @@ export function SearchView({
 
   return (
     <section className="search" aria-label="Search">
-      <div className="search-form">
+      <form
+        className="search-form"
+        onSubmit={(e) => {
+          e.preventDefault();
+          doSearch();
+        }}
+      >
         <div className="search-row">
           <label className="field grow">
             <span className="field-label">Query</span>
             <input
               className="input"
+              data-testid="search-q"
               autoFocus
               value={form.q}
-              placeholder="filename or content terms — FTS5 quoting supported"
-              onChange={(e) => set("q", e.target.value)}
+              placeholder="filename or content terms — optional; FTS5 quoting supported"
+              onChange={(e) => setField("q", e.target.value)}
             />
           </label>
           <label className="field">
             <span className="field-label">Mode</span>
-            <select className="input select" value={form.mode} onChange={(e) => set("mode", e.target.value as SearchMode)}>
+            <select
+              className="input select"
+              data-testid="search-mode"
+              value={form.mode}
+              disabled={!hasQ}
+              title={hasQ ? "Where the query text is matched" : "Only applies to query text"}
+              onChange={(e) => setField("mode", e.target.value as SearchMode)}
+            >
               <option value="both">Name + content</option>
               <option value="name">Name only</option>
               <option value="content">Content only</option>
             </select>
           </label>
+          <div className="field search-go">
+            <span className="field-label">&nbsp;</span>
+            <button
+              type="submit"
+              className={`btn btn-primary search-btn${dirty ? " is-dirty" : ""}`}
+              data-testid="search-run"
+              disabled={!runnable}
+              title={
+                runnable
+                  ? dirty
+                    ? "Run the search with your changes"
+                    : "Run the search"
+                  : "Enter query text, or add a condition, before searching"
+              }
+            >
+              <Icon name="search" />
+              Search
+            </button>
+          </div>
         </div>
 
         <div className="search-row">
@@ -227,89 +290,146 @@ export function SearchView({
             <span className="field-label">Scope</span>
             <input
               className="input"
+              data-testid="search-scope"
               value={form.everywhere ? "" : form.scope}
               disabled={form.everywhere}
               placeholder={form.everywhere ? "everywhere (all index roots)" : "/mnt/user/…"}
-              onChange={(e) => set("scope", e.target.value)}
+              onChange={(e) => setField("scope", e.target.value)}
             />
           </label>
           <label className="field check-field">
-            <input type="checkbox" checked={form.everywhere} onChange={(e) => set("everywhere", e.target.checked)} />
+            <input
+              type="checkbox"
+              data-testid="search-everywhere"
+              checked={form.everywhere}
+              onChange={(e) => setField("everywhere", e.target.checked)}
+            />
             Everywhere
           </label>
           <label className="field">
             <span className="field-label">Extensions</span>
             <input
               className="input"
+              data-testid="search-ext"
               value={form.ext}
               placeholder="go, md, log"
-              onChange={(e) => set("ext", e.target.value)}
+              title="Comma list, case-insensitive; added to any type pre-filter below"
+              onChange={(e) => setField("ext", e.target.value)}
             />
+          </label>
+          <label className="field">
+            <span className="field-label">Sort</span>
+            <select
+              className="input select"
+              data-testid="search-sort"
+              value={effectiveSort(form)}
+              onChange={(e) => setField("sort", e.target.value as SearchSort)}
+            >
+              <option value="relevance" disabled={!hasQ} title={hasQ ? "" : "Needs query text"}>
+                Relevance{hasQ ? "" : " (needs query text)"}
+              </option>
+              <option value="name">Name</option>
+              <option value="size">Size</option>
+              <option value="mtime">Modified</option>
+            </select>
+          </label>
+          <label className="field">
+            <span className="field-label">Direction</span>
+            <select
+              className="input select"
+              data-testid="search-dir"
+              value={form.dir}
+              onChange={(e) => setField("dir", e.target.value as SortDir)}
+            >
+              <option value="asc">Ascending</option>
+              <option value="desc">Descending</option>
+            </select>
           </label>
         </div>
 
-        <div className="search-row">
-          <label className="field">
-            <span className="field-label">Min size</span>
-            <span className="input-group">
-              <input
-                className="input num"
-                type="number"
-                min="0"
-                value={form.minSize}
-                onChange={(e) => set("minSize", e.target.value)}
-              />
-              <select className="input select unit" value={form.minUnit} onChange={(e) => set("minUnit", e.target.value)}>
-                {SIZE_UNITS.map((u) => (
-                  <option key={u.id} value={u.id}>
-                    {u.label}
-                  </option>
-                ))}
-              </select>
-            </span>
-          </label>
-          <label className="field">
-            <span className="field-label">Max size</span>
-            <span className="input-group">
-              <input
-                className="input num"
-                type="number"
-                min="0"
-                value={form.maxSize}
-                onChange={(e) => set("maxSize", e.target.value)}
-              />
-              <select className="input select unit" value={form.maxUnit} onChange={(e) => set("maxUnit", e.target.value)}>
-                {SIZE_UNITS.map((u) => (
-                  <option key={u.id} value={u.id}>
-                    {u.label}
-                  </option>
-                ))}
-              </select>
-            </span>
-          </label>
-          <label className="field">
-            <span className="field-label">Modified after</span>
-            <input className="input" type="date" value={form.after} onChange={(e) => set("after", e.target.value)} />
-          </label>
-          <label className="field">
-            <span className="field-label">Modified before</span>
-            <input className="input" type="date" value={form.before} onChange={(e) => set("before", e.target.value)} />
-          </label>
+        <div className="search-conds" data-testid="search-conds">
+          {form.conds.map((c, i) => (
+            <ConditionRow
+              key={c.id}
+              index={i}
+              cond={c}
+              cats={cats}
+              scope={scopeForValues}
+              onChange={updateCond}
+              onRemove={removeCond}
+            />
+          ))}
+
+          <div className="search-cond-actions">
+            <button
+              type="button"
+              className="btn btn-sm"
+              data-testid="cond-add"
+              disabled={form.conds.length >= MAX_CONDS}
+              title={form.conds.length >= MAX_CONDS ? `At most ${MAX_CONDS} conditions per search` : "Add a condition"}
+              onClick={addCond}
+            >
+              + Add condition
+            </button>
+            {form.conds.length > 1 ? <span className="muted">all conditions must match</span> : null}
+          </div>
+
+          {typeCats.length ? (
+            <div className="ext-prefilter" data-testid="ext-prefilter">
+              <label className="check-field">
+                <input
+                  type="checkbox"
+                  data-testid="ext-prefilter-check"
+                  checked={form.extFilter}
+                  onChange={(e) => setField("extFilter", e.target.checked)}
+                />
+                <span data-testid="ext-prefilter-label" title={allPreExts.join(", ")}>
+                  Only files with {typeNames} extensions ({allPreExts.slice(0, EXT_PREVIEW).join(", ")}
+                  {allPreExts.length > EXT_PREVIEW ? ", …" : ""})
+                </span>
+              </label>
+              {allPreExts.length > EXT_PREVIEW ? (
+                <button
+                  type="button"
+                  className="link-btn"
+                  data-testid="ext-prefilter-expand"
+                  aria-expanded={extOpen}
+                  onClick={() => setExtOpen((v) => !v)}
+                >
+                  {extOpen ? "hide list" : `show all ${allPreExts.length}`}
+                </button>
+              ) : null}
+              <span className="muted">— matching is case-insensitive; unticking searches every file in the scope</span>
+              {extOpen ? (
+                <code className="ext-list" data-testid="ext-prefilter-full">
+                  {allPreExts.join(", ")}
+                </code>
+              ) : null}
+            </div>
+          ) : null}
         </div>
-      </div>
+      </form>
 
       <div className="search-status">
         {loading ? <Spinner label="searching…" /> : null}
         {result ? (
           <>
             <strong>{result.total.toLocaleString()}</strong>
-            <span className="muted"> match{result.total === 1 ? "" : "es"} in {result.tookMs} ms</span>
+            <span className="muted">
+              {" "}
+              match{result.total === 1 ? "" : "es"} in {result.tookMs} ms
+            </span>
             {!result.indexFresh ? (
               <span className="pill pill-warn" title="A crawl is pending or in progress — results may be stale">
                 index may be stale
               </span>
             ) : null}
           </>
+        ) : null}
+        {dirty ? (
+          <span className="pill pill-warn" data-testid="search-dirty" title="These results are from the previous search">
+            filters changed — press Search
+          </span>
         ) : null}
       </div>
 
@@ -318,14 +438,15 @@ export function SearchView({
       <div className="search-results">
         {loading && !result ? <SkeletonRows rows={10} cols={3} /> : null}
 
-        {!loading && !form.q.trim() ? (
-          <EmptyState title="Type to search">
-            Name matching is prefix-based; content matching needs the content index enabled in{" "}
+        {!run && !loading ? (
+          <EmptyState title="Ready to search">
+            Nothing is fetched until you press <strong>Search</strong> — enter query text, or add a metadata condition
+            (a query is not required). Content matching needs the content index enabled in{" "}
             <a href={SETTINGS_HREF}>Settings</a>.
           </EmptyState>
         ) : null}
 
-        {!loading && result && hits.length === 0 && form.q.trim() ? (
+        {!loading && run && result && hits.length === 0 ? (
           <EmptyState title="No matches">
             {emptyIndex ? (
               <>
@@ -333,7 +454,7 @@ export function SearchView({
                 <a href={SETTINGS_HREF}>Settings</a>.
               </>
             ) : (
-              <>Try a broader scope, a different mode, or loosening the size/date filters.</>
+              <>Try a broader scope, fewer conditions, or unticking the extension pre-filter.</>
             )}
           </EmptyState>
         ) : null}
@@ -357,12 +478,7 @@ export function SearchView({
             >
               <div className="hit-main">
                 <EntryIcon type={e.type} />
-                <button
-                  type="button"
-                  className="hit-name"
-                  title={e.path}
-                  onClick={() => openHit(e)}
-                >
+                <button type="button" className="hit-name" title={e.path} onClick={() => openHit(e)}>
                   {e.name}
                 </button>
                 <span className={`pill pill-muted matched-${hit.matchedIn}`}>{hit.matchedIn}</span>
@@ -397,7 +513,12 @@ export function SearchView({
           <span className="pager-label">
             {offset + 1}–{Math.min(offset + hits.length, result.total)} of {result.total.toLocaleString()}
           </span>
-          <button type="button" className="btn btn-sm" disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - PAGE))}>
+          <button
+            type="button"
+            className="btn btn-sm"
+            disabled={offset === 0}
+            onClick={() => setOffset(Math.max(0, offset - PAGE))}
+          >
             ‹ Prev
           </button>
           <button
@@ -424,16 +545,265 @@ export function SearchView({
   );
 }
 
-function normaliseExts(raw: string): string {
-  return raw
-    .split(/[,\s]+/)
-    .map((s) => s.trim().replace(/^\./, "").toLowerCase())
-    .filter(Boolean)
-    .join(",");
+/* ------------------------------------------------------------ condition row */
+
+function ConditionRow({
+  index,
+  cond,
+  cats,
+  scope,
+  onChange,
+  onRemove,
+}: {
+  index: number;
+  cond: Cond;
+  cats: SearchCategory[];
+  scope: string;
+  onChange: (c: Cond) => void;
+  onRemove: (id: number) => void;
+}) {
+  const cat = findCategory(cats, cond.cat);
+  const field = findField(cats, cond.cat, cond.key);
+  const [suggest, setSuggest] = useState<SearchValueCount[]>([]);
+  const listId = `cond-vals-${cond.id}`;
+
+  /**
+   * The one request the form is allowed to make without the Search button:
+   * filling in the dropdown the user just opened. Fired on focus, never on
+   * every keystroke, so it costs one round trip per field the user touches.
+   */
+  const loadValues = useCallback(() => {
+    if (!field) return;
+    searchValues({ key: field.key, prefix: cond.value, path: scope || undefined, limit: 30 })
+      .then(setSuggest)
+      .catch(() => setSuggest([]));
+  }, [field, cond.value, scope]);
+
+  const pickCategory = (id: string) =>
+    // Switching category invalidates the field, and with it the operator, the
+    // value and its unit — none of them mean anything in the new one.
+    onChange({ ...cond, cat: id, key: "", op: "", value: "", unit: DEFAULT_BYTE_UNIT });
+
+  const pickField = (key: string) => {
+    const f = findField(cats, cond.cat, key);
+    setSuggest([]);
+    if (!f) return onChange({ ...cond, key: "", op: "", value: "", unit: DEFAULT_BYTE_UNIT });
+    onChange({
+      ...cond,
+      key,
+      op: defaultOp(f.type),
+      value: f.type === "bool" ? "true" : "",
+      unit: DEFAULT_BYTE_UNIT,
+    });
+  };
+
+  return (
+    <div className="search-cond" data-testid="cond-row" data-index={index}>
+      <span className="cond-join">{index === 0 ? "Where" : "and"}</span>
+
+      <select
+        className="input select"
+        data-testid="cond-cat"
+        aria-label="Category"
+        value={cond.cat}
+        onChange={(e) => pickCategory(e.target.value)}
+      >
+        {cats.map((c) => (
+          <option key={c.id} value={c.id}>
+            {c.label}
+          </option>
+        ))}
+      </select>
+
+      <select
+        className="input select"
+        data-testid="cond-field"
+        aria-label="Field"
+        value={cond.key}
+        onChange={(e) => pickField(e.target.value)}
+      >
+        <option value="">Field…</option>
+        {(cat?.fields ?? []).map((f) => (
+          <option key={f.key} value={f.key}>
+            {f.label}
+          </option>
+        ))}
+      </select>
+
+      {field ? (
+        <select
+          className="input select cond-op"
+          data-testid="cond-op"
+          aria-label="Operator"
+          value={cond.op}
+          onChange={(e) => onChange({ ...cond, op: e.target.value })}
+        >
+          {OPS[field.type].map((o) => (
+            <option key={o.op} value={o.op}>
+              {o.label}
+            </option>
+          ))}
+        </select>
+      ) : null}
+
+      {field ? <ValueEditor field={field} cond={cond} suggest={suggest} listId={listId} onChange={onChange} onOpen={loadValues} /> : null}
+
+      <button
+        type="button"
+        className="btn btn-icon btn-sm cond-remove"
+        data-testid="cond-remove"
+        title="Remove this condition"
+        aria-label="Remove this condition"
+        onClick={() => onRemove(cond.id)}
+      >
+        ×
+      </button>
+    </div>
+  );
 }
 
-function numOrUndef(v: string | null): number | undefined {
-  if (v === null || v === "") return undefined;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : undefined;
+function ValueEditor({
+  field,
+  cond,
+  suggest,
+  listId,
+  onChange,
+  onOpen,
+}: {
+  field: SearchField;
+  cond: Cond;
+  suggest: SearchValueCount[];
+  listId: string;
+  onChange: (c: Cond) => void;
+  onOpen: () => void;
+}) {
+  const set = (value: string) => onChange({ ...cond, value });
+
+  // API.md ships `values` for bool fields as well as enums, so use them when
+  // they are there and fall back to plain true/false when they are not.
+  if (field.type === "bool") {
+    const choices = field.values?.length
+      ? field.values
+      : [
+          { value: "true", label: "Yes" },
+          { value: "false", label: "No" },
+        ];
+    return (
+      <select
+        className="input select"
+        data-testid="cond-value"
+        aria-label="Value"
+        value={cond.value || choices[0].value}
+        onChange={(e) => set(e.target.value)}
+      >
+        {choices.map((c) => (
+          <option key={c.value} value={c.value}>
+            {c.label}
+          </option>
+        ))}
+      </select>
+    );
+  }
+
+  // An enum whose choices the daemon shipped: the user picks the label, the
+  // wire gets the value ("Dolby Digital (AC-3)" → "ac3").
+  if (field.type === "enum" && field.values?.length) {
+    return (
+      <select
+        className="input select"
+        data-testid="cond-value"
+        aria-label="Value"
+        value={cond.value}
+        onChange={(e) => set(e.target.value)}
+      >
+        <option value="">Value…</option>
+        {field.values.map((v) => (
+          <option key={v.value} value={v.value}>
+            {v.label}
+          </option>
+        ))}
+      </select>
+    );
+  }
+
+  if (field.type === "date") {
+    return (
+      <input
+        className="input"
+        data-testid="cond-value"
+        aria-label="Value"
+        type="date"
+        value={cond.value}
+        onChange={(e) => set(e.target.value)}
+      />
+    );
+  }
+
+  if (field.type === "bytes") {
+    return (
+      <span className="input-group">
+        <input
+          className="input num"
+          data-testid="cond-value"
+          aria-label="Value"
+          type="number"
+          min="0"
+          value={cond.value}
+          onChange={(e) => set(e.target.value)}
+        />
+        <select
+          className="input select unit"
+          data-testid="cond-unit"
+          aria-label="Unit"
+          value={cond.unit}
+          onChange={(e) => onChange({ ...cond, unit: e.target.value })}
+        >
+          {BYTE_UNITS.map((u) => (
+            <option key={u.id} value={u.id}>
+              {u.label}
+            </option>
+          ))}
+        </select>
+      </span>
+    );
+  }
+
+  if (field.type === "number") {
+    return (
+      <span className="input-group">
+        <input
+          className="input num"
+          data-testid="cond-value"
+          aria-label="Value"
+          type="number"
+          value={cond.value}
+          onChange={(e) => set(e.target.value)}
+        />
+        {field.unit ? <span className="unit-label">{field.unit}</span> : null}
+      </span>
+    );
+  }
+
+  // text (and an enum the daemon left open): free text with type-ahead.
+  return (
+    <>
+      <input
+        className="input"
+        data-testid="cond-value"
+        aria-label="Value"
+        list={listId}
+        value={cond.value}
+        placeholder={field.label}
+        onFocus={onOpen}
+        onChange={(e) => set(e.target.value)}
+      />
+      <datalist id={listId} data-testid="cond-datalist">
+        {suggest.map((s) => (
+          <option key={s.value} value={s.value}>
+            {s.count ? `${s.count}` : ""}
+          </option>
+        ))}
+      </datalist>
+    </>
+  );
 }

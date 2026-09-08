@@ -38,6 +38,17 @@ type searchData struct {
 	TookMs     int64             `json:"tookMs"`
 }
 
+// fieldsData is GET /search/fields: the metadata vocabulary the UI turns into
+// cascading category → field → value dropdowns.
+type fieldsData struct {
+	Categories []types.MetaCategory `json:"categories"`
+}
+
+// valuesData is GET /search/values: the distinct values indexed for one key.
+type valuesData struct {
+	Values []types.MetaValue `json:"values"`
+}
+
 type configData struct {
 	Config types.IndexConfig `json:"config"`
 	// AllowedRoots are the daemon's boot-time browse roots: every entry in
@@ -95,7 +106,9 @@ func (s *server) search(w http.ResponseWriter, r *http.Request) (any, error) {
 	q := r.URL.Query()
 	text := q.Get("q")
 	if strings.TrimSpace(text) == "" {
-		return nil, types.Errf(types.ErrBadRequest, "q is required")
+		// Whitespace is not a query; normalise it away so the index sees the
+		// filters-only case cleanly.
+		text = ""
 	}
 	mode, err := enumParam(q, "mode", "both", "name", "content", "both")
 	if err != nil {
@@ -125,6 +138,21 @@ func (s *server) search(w http.ResponseWriter, r *http.Request) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	meta, err := parseMetaFilters(q)
+	if err != nil {
+		return nil, err
+	}
+	// sort/dir are passed through unset: the index owns the default (relevance
+	// when there is query text, name ascending otherwise), and inventing one
+	// here would fight it.
+	sortKey, err := enumParam(q, "sort", "", "relevance", "name", "size", "mtime")
+	if err != nil {
+		return nil, err
+	}
+	dir, err := enumParam(q, "dir", "", "asc", "desc")
+	if err != nil {
+		return nil, err
+	}
 
 	query := types.SearchQuery{
 		Q:       text,
@@ -135,8 +163,23 @@ func (s *server) search(w http.ResponseWriter, r *http.Request) (any, error) {
 		MaxSize: maxSize,
 		After:   after,
 		Before:  before,
+		Meta:    meta,
+		Sort:    sortKey,
+		Dir:     dir,
 		Limit:   int(limit),
 		Offset:  int(offset),
+	}
+
+	// `q` is optional, but only because a filter can stand in for it: a search
+	// with neither is a request for "every file the index knows", which is a
+	// mistake rather than a query. This is what lets the UI ask for "files
+	// bigger than 20 GB" without a dummy search term.
+	hasFilter := strings.TrimSpace(query.Path) != "" || len(query.Exts) > 0 ||
+		query.MinSize >= 0 || query.MaxSize >= 0 ||
+		query.After > 0 || query.Before > 0 || len(query.Meta) > 0
+	if text == "" && !hasFilter {
+		return nil, types.Errf(types.ErrBadRequest,
+			"q is required unless at least one filter is given (path, ext, minSize, maxSize, after, before or meta)")
 	}
 
 	start := time.Now()
@@ -155,6 +198,63 @@ func (s *server) search(w http.ResponseWriter, r *http.Request) (any, error) {
 		IndexFresh: st.State == "idle" && st.LastFullScan > 0,
 		TookMs:     took.Milliseconds(),
 	}, nil
+}
+
+// searchFields serves the metadata vocabulary: which categories exist, which
+// fields each one carries and, for enumerated fields, the fixed value list.
+// It takes no parameters — the client picks a category and applies that
+// category's default extensions itself by sending `ext=` on /search.
+func (s *server) searchFields(w http.ResponseWriter, r *http.Request) (any, error) {
+	idx, err := s.index()
+	if err != nil {
+		return nil, err
+	}
+	cats := idx.MetaFields()
+	if cats == nil {
+		cats = []types.MetaCategory{}
+	}
+	// JSON clients iterate these; never hand them null.
+	for i := range cats {
+		if cats[i].Extensions == nil {
+			cats[i].Extensions = []string{}
+		}
+		if cats[i].Fields == nil {
+			cats[i].Fields = []types.MetaFieldDef{}
+		}
+		for j := range cats[i].Fields {
+			if cats[i].Fields[j].Values == nil {
+				cats[i].Fields[j].Values = []types.MetaEnumValue{}
+			}
+		}
+	}
+	return fieldsData{Categories: cats}, nil
+}
+
+// searchValues serves the distinct values recorded for one metadata key, for
+// the value dropdown and its type-ahead. It is behind the busy limiter because
+// the UI calls it while the user types.
+func (s *server) searchValues(w http.ResponseWriter, r *http.Request) (any, error) {
+	idx, err := s.index()
+	if err != nil {
+		return nil, err
+	}
+	q := r.URL.Query()
+	key, err := metaKeyParam(q.Get("key"))
+	if err != nil {
+		return nil, err
+	}
+	limit, err := intParam(q, "limit", valuesLimitDefault, 0, valuesLimitMax)
+	if err != nil {
+		return nil, err
+	}
+	values, err := idx.MetaValues(r.Context(), key, q.Get("prefix"), q.Get("path"), int(limit))
+	if err != nil {
+		return nil, err
+	}
+	if values == nil {
+		values = []types.MetaValue{}
+	}
+	return valuesData{Values: values}, nil
 }
 
 func (s *server) indexStatus(w http.ResponseWriter, r *http.Request) (any, error) {
