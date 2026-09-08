@@ -32,6 +32,7 @@
 - Why: the plugin manager rewrites the whole package to the USB boot flash on every update, so bundling 190 MB of ffmpeg would have meant 190 MB of flash writes for every 5 MB file-browser release. The companion is versioned by ffmpeg's own version and is only rewritten when ffmpeg changes
 - Either plugin may be installed first; Settings > File Browser Settings shows whether transcoding is available and how to add it
 - Everything else still works without the companion plugin: browsing, search, viewing, downloads and native playback are unaffected
+- Bookmarkable deep links: the page URL carries ?path= and follows you as you navigate
 
 ###2026.09.07d
 - Fix: updates were recorded as installed without actually installing (Unraid's upgradepkg skipped the package as "not newer"); the installer now replaces the package explicitly and verifies the installed version

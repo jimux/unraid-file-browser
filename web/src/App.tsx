@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Entry } from "./api/types";
-import { getIndexConfig } from "./api/client";
+import { ApiError, getIndexConfig, stat } from "./api/client";
+import { ErrorBanner } from "./components/Feedback";
 import { TopBar, type ViewMode } from "./components/TopBar";
 import { TreeSidebar } from "./components/TreeSidebar";
 import { BrowserView, type SortState } from "./views/BrowserView";
@@ -10,6 +11,7 @@ import { SettingsView } from "./views/SettingsView";
 import { ViewerPanel } from "./views/ViewerPanel";
 import { useRoute } from "./hooks/useRoute";
 import { useTheme } from "./hooks/useTheme";
+import { publishLocation, readDeepLinkPath } from "./lib/hostLink";
 import { isMedia, openPlayer } from "./lib/media";
 import { browseHref, navigate, viewHref } from "./lib/router";
 import { basename, parentPath } from "./lib/paths";
@@ -51,10 +53,74 @@ export default function App() {
 
   const defaultPath = roots[0] ?? FALLBACK_ROOTS[0];
 
-  // Land on the first root when there is no (or an unparsable) hash.
+  /* ------------------------------------------------------- ?path= deep link */
+
+  /**
+   * The bookmarkable location, handed to us on the iframe URL by the host page
+   * (see lib/hostLink.ts). Read once: it is a *boot* input, and after that the
+   * hash is the only routing authority.
+   */
+  const [deepLink] = useState(() => readDeepLinkPath());
+  const [deepLinkDone, setDeepLinkDone] = useState(deepLink === null);
+  const [deepLinkError, setDeepLinkError] = useState<ApiError | null>(null);
+  const bootRouteRef = useRef(route.name);
+
+  /**
+   * Directory or file? `?path=` carries only the path, so one `fs/stat` decides
+   * — and it is not an *extra* round trip in wall-clock terms: it is issued at
+   * mount, in parallel with the index-config fetch above, before any listing
+   * request exists to be delayed by it.
+   *
+   * The rule is deliberately the same one the file grid uses when you activate
+   * a row: `dir` and `archive` browse (an archive lists exactly like a folder),
+   * everything else opens the viewer panel. So a bookmark made on a file
+   * reopens that file's viewer, and a bookmark made inside an archive lands
+   * back inside the archive.
+   *
+   * A failure is not an error state: we keep the app on the default root and
+   * show the daemon's own envelope (NOT_FOUND / FORBIDDEN / …) in a banner, so
+   * a stale bookmark degrades to "here is why, and here is the root" rather
+   * than a blank screen. Same for a `?path=` that never made it past
+   * `readDeepLinkPath` — that one simply reads as absent.
+   */
   useEffect(() => {
-    if (route.name === "unknown" && rootsReady) navigate(browseHref(defaultPath), true);
-  }, [route.name, rootsReady, defaultPath]);
+    if (deepLink === null) return;
+    // An explicit hash is more specific than the host's query param and wins;
+    // the player window (#/play/) is never a deep-link target at all.
+    if (bootRouteRef.current !== "unknown") {
+      setDeepLinkDone(true);
+      return;
+    }
+    let alive = true;
+    const ac = new AbortController();
+    stat(deepLink, ac.signal)
+      .then((r) => {
+        if (!alive) return;
+        const type = r.entry?.type;
+        const browsable = type === "dir" || type === "archive";
+        navigate(browsable ? browseHref(deepLink) : viewHref(deepLink), true);
+      })
+      .catch((e) => {
+        if (!alive) return;
+        if (e instanceof DOMException && e.name === "AbortError") return;
+        setDeepLinkError(e instanceof ApiError ? e : new ApiError("INTERNAL", String(e)));
+      })
+      .finally(() => {
+        if (alive) setDeepLinkDone(true);
+      });
+    return () => {
+      alive = false;
+      ac.abort();
+    };
+    // Mount-only: `deepLink` and the boot route are both frozen at first render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Land on the first root when there is no (or an unparsable) hash — but not
+  // before the deep link has had its say, or we would bounce off the root.
+  useEffect(() => {
+    if (route.name === "unknown" && rootsReady && deepLinkDone) navigate(browseHref(defaultPath), true);
+  }, [route.name, rootsReady, deepLinkDone, defaultPath]);
 
   // Remember the last browsed directory so Search can prefill its scope.
   const lastDirRef = useRef(defaultPath);
@@ -68,6 +134,22 @@ export default function App() {
   useEffect(() => {
     if (route.name === "browse" || route.name === "view") lastDirRef.current = browsePath;
   }, [route.name, browsePath]);
+
+  /**
+   * What the host's `?path=` reflects: the directory being browsed, except
+   * while the viewer panel is up, when it is the *file* — so a bookmark taken
+   * with a file open reopens that file. Search and Settings keep publishing the
+   * directory behind them, which is the location a bookmark taken there should
+   * restore.
+   */
+  const hostPath = route.name === "view" ? route.path : browsePath;
+
+  useEffect(() => {
+    if (isPlayer) return; // the player window is standalone; it owns no bookmark
+    if (!deepLinkDone) return; // do not publish the placeholder root mid-resolve
+    if (route.name === "unknown") return; // nothing routed yet
+    publishLocation(hostPath);
+  }, [isPlayer, deepLinkDone, route.name, hostPath]);
 
   const go = useCallback((p: string) => navigate(browseHref(p)), []);
 
@@ -109,6 +191,19 @@ export default function App() {
   return (
     <div className="app">
       <TopBar mode={mode} path={browsePath} onNavigate={go} onReload={() => setReloadNonce((n) => n + 1)} />
+
+      {deepLinkError ? (
+        <div className="deeplink-error" data-testid="deeplink-error">
+          <ErrorBanner error={deepLinkError}>
+            <div className="banner-hint">
+              Could not open the bookmarked path <code>{deepLink}</code> — showing <code>{defaultPath}</code> instead.
+            </div>
+            <button type="button" className="btn btn-sm" onClick={() => setDeepLinkError(null)}>
+              Dismiss
+            </button>
+          </ErrorBanner>
+        </div>
+      ) : null}
 
       <div className="app-body">
         <TreeSidebar roots={roots} currentPath={browsePath} onNavigate={go} />

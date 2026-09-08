@@ -197,7 +197,7 @@ not on the flash drive.
 `FileBrowser.page` embeds the SPA in an iframe:
 
 ```
-/plugins/filebrowser/app/index.html?theme=<black|white|azure|gray>&csrf=<token>
+/plugins/filebrowser/app/index.html?theme=<black|white|azure|gray>&csrf=<token>&v=<version>&path=<abs path>
 ```
 
 * `theme` is `$display['theme']` narrowed the way the webGUI narrows it itself
@@ -256,6 +256,23 @@ owns its own lifetime rather than waiting on the daemon:
 A closed tab is detected within two ping intervals (~10 s), because the first
 write after the client goes away is what triggers the peer reset and the second
 one fails. The socket is closed on every exit path.
+
+* `v` is the installed plugin version, purely a cache-buster: `index.html`
+  lives at a fixed URL, so without it a browser keeps serving the previous
+  app (and the old hashed bundle) after an update.
+* `path` is optional and carries a deep link. **The page URL itself now
+  accepts one too**: `/FileBrowser?path=<urlencoded absolute path>` is a
+  supported entry point, and it is what makes bookmarks and the browser Back
+  button work. The SPA reports its location to the page with a
+  `postMessage({type:"filebrowser:location", path})` (same-origin target,
+  and the page verifies both `event.origin` and that `event.source` is its
+  own iframe), and the page mirrors it into its address bar with
+  `history.replaceState` — never `pushState`, which would interleave with the
+  iframe's own history.
+
+  `path` is a **hint, not an authorization**. The page caps it at 4096 bytes
+  and rejects non-absolute values and control characters; confinement to the
+  browse roots remains entirely the daemon's job.
 
 ## Version bump procedure
 

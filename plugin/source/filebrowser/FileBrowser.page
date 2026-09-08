@@ -33,10 +33,29 @@ $fb_ver = @file_get_contents('/usr/local/emhttp/plugins/filebrowser/VERSION');
 $fb_ver = preg_replace('/[^A-Za-z0-9.]/', '', (string)$fb_ver);
 if ($fb_ver === '') $fb_ver = (string)@filemtime('/usr/local/emhttp/plugins/filebrowser/app/index.html');
 
+// Bookmarkable deep link. The SPA lives in an iframe, so the URL the user sees
+// and refreshes is *this* page's; the script below keeps `?path=` here in sync
+// with wherever the SPA is browsing (postMessage -> history.replaceState), and
+// on load we hand that path back to the SPA on the iframe URL.
+//
+// $_GET['path'] is attacker-supplied and is treated as pure data: it is never
+// used to touch the filesystem, never logged, and only ever re-encoded into the
+// iframe URL (rawurlencode below, then htmlspecialchars on the attribute). The
+// checks here are transport hygiene - length and control characters - and the
+// daemon still does the real path confinement, exactly as for any other path.
+$fb_path = '';
+if (isset($_GET['path']) && is_string($_GET['path'])) {
+  $p = $_GET['path'];
+  if ($p !== '' && strlen($p) <= 4096 && $p[0] === '/' && !preg_match('/[\x00-\x1F\x7F]/', $p)) {
+    $fb_path = $p;
+  }
+}
+
 $fb_src = $fb_app
         . '?theme=' . rawurlencode($fb_theme)
         . '&csrf='  . rawurlencode((string)$fb_csrf)
-        . '&v='     . rawurlencode($fb_ver);
+        . '&v='     . rawurlencode($fb_ver)
+        . ($fb_path === '' ? '' : '&path=' . rawurlencode($fb_path));
 ?>
 <style>
 #fb-wrap        { margin:0; padding:0; }
@@ -97,6 +116,42 @@ $fb_src = $fb_app
     window.setTimeout(fit, 250);
     window.setTimeout(fit, 1000);
   }
+
+  // ---- bookmarkable ?path= -----------------------------------------------
+  // The SPA posts its current browse location up here whenever it settles; we
+  // mirror it into our own address bar so refresh and bookmarks work. Nothing
+  // is sent back down: the SPA got its starting path from the iframe URL above.
+  //
+  // replaceState, never pushState - the iframe keeps its own hash history, and
+  // a parent entry per navigation would interleave with it and make Back jump
+  // around. The path is data: it goes through encodeURIComponent into the query
+  // string and is never written into HTML, an attribute, or script source.
+  var lastPath = null;
+  function fbSyncPath(p) {
+    if (p === lastPath) return;
+    lastPath = p;
+    try {
+      var u   = new URL(window.location.href);
+      u.searchParams.delete('path');
+      var rest = u.searchParams.toString();
+      history.replaceState(history.state, '',
+        u.pathname + '?path=' + encodeURIComponent(p) + (rest ? '&' + rest : '') + u.hash);
+    } catch (e) { /* an address bar we may not rewrite is not worth breaking over */ }
+  }
+  window.addEventListener('message', function (ev) {
+    // Two checks, both required: the message must come from our own origin, and
+    // from our own iframe. Either alone lets a stranger (another frame on the
+    // page, an opener, a cross-origin poster) drive this page's URL.
+    if (!frame || ev.origin !== window.location.origin || ev.source !== frame.contentWindow) return;
+    var d = ev.data;
+    if (!d || typeof d !== 'object' || d.type !== 'filebrowser:location') return;
+    var p = d.path;
+    // Same transport hygiene as the PHP above, applied to the value we are
+    // about to put in the URL: absolute, bounded, no control characters.
+    if (typeof p !== 'string' || p === '' || p.length > 4096) return;
+    if (p.charAt(0) !== '/' || /[\x00-\x1f\x7f]/.test(p)) return;
+    fbSyncPath(p);
+  });
 
   // ---- start button (offline banner) -------------------------------------
   var btn = document.getElementById('fb-start');

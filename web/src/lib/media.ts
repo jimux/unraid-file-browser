@@ -37,6 +37,7 @@
  */
 
 import type { Entry } from "../api/types";
+import { PATH_PARAM } from "./hostLink";
 import { extOf } from "./paths";
 import { playHref, navigate, type PlayOptions } from "./router";
 
@@ -318,7 +319,25 @@ export function canPlayDirectly(entry: { name: string; mime?: string | null } | 
  * rides there too, for "Play as media…" on a file nothing classifies as media.
  */
 export function playerUrl(path: string, opts?: PlayOptions | null): string {
-  return `${window.location.pathname}${window.location.search}${playHref(path, opts)}`;
+  return `${window.location.pathname}${playerSearch()}${playHref(path, opts)}`;
+}
+
+/**
+ * The search string the player window inherits: ours, minus the host's `?path=`
+ * deep link. The player is a standalone document whose location is the file in
+ * its hash — carrying a stale bookmark param alongside it would be noise at
+ * best, and in the standalone (non-iframe) case the player would then be
+ * rewriting a param nobody reads. `theme` and `csrf` still ride along.
+ */
+function playerSearch(): string {
+  try {
+    const sp = new URLSearchParams(window.location.search);
+    sp.delete(PATH_PARAM);
+    const s = sp.toString();
+    return s ? `?${s}` : "";
+  } catch {
+    return window.location.search;
+  }
 }
 
 /**
