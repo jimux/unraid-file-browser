@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"net/http"
@@ -46,9 +47,27 @@ func statusFor(code string) int {
 }
 
 func writeOK(w http.ResponseWriter, data any) {
+	// Marshal BEFORE committing the status. Encoding straight into the
+	// ResponseWriter writes 200 first, so a value json cannot represent (a NaN
+	// or +Inf float, an unsupported type) leaves the client holding a 200 with
+	// an empty body — indistinguishable from success, and silent because the
+	// encoder's error had nowhere to go. Failing loudly here turns that into a
+	// logged 500 the client can report.
+	buf, err := json.Marshal(envelope{OK: true, Data: data})
+	if err != nil {
+		slog.Error("api: response encoding failed", "err", err, "type", fmt.Sprintf("%T", data))
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(envelope{
+			OK:    false,
+			Error: &errorBody{Code: types.ErrInternal, Message: "the daemon could not encode its response"},
+		})
+		return
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(envelope{OK: true, Data: data})
+	buf = append(buf, '\n')
+	_, _ = w.Write(buf)
 }
 
 // writeError renders err as the error envelope, mapping unrecognised errors to

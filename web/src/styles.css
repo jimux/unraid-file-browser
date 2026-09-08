@@ -1815,13 +1815,39 @@ mark {
 .player.is-video .player-stage {
   background: #000;
 }
+/*
+ * Out of flow on purpose. `.player-stage` is a centred grid, and a centred
+ * (non-stretched) item sizes its implicit row track to the item's *max-content*
+ * height — so an in-flow <video> made the track as tall as the file's intrinsic
+ * height (a 608x1080 phone clip → a 2274px track), the stage scrolled, the
+ * picture rendered at intrinsic size instead of fitting, and the native control
+ * bar — which draws at the bottom of the *element* — sat ~1500px below the
+ * window. Absolutely positioning the video takes it out of track sizing
+ * entirely: it fills the stage exactly, `object-fit: contain` letterboxes any
+ * aspect ratio into it, and the control bar lands on the stage's bottom edge,
+ * which is the window's bottom edge. The in-flow stage children (the audio
+ * card, the error cards) are untouched and stay centred and scrollable.
+ */
 .player-video {
+  position: absolute;
+  inset: 0;
   width: 100%;
   height: 100%;
-  max-height: 100%;
   object-fit: contain;
   background: #000;
   display: block;
+}
+/*
+ * Chromium draws its own scrim behind the native control bar, and its default
+ * ramps to very nearly opaque black across the bottom ~100px of the picture.
+ * These are non-standard pseudo-elements (Chromium/WebKit only); a browser that
+ * does not know them drops the rule and keeps its own controls, which is the
+ * correct fallback. Toned down, not removed: the bar still needs a backdrop or
+ * its white glyphs vanish over a bright frame.
+ */
+.player-video::-webkit-media-controls-panel {
+  background-color: transparent;
+  background-image: linear-gradient(to top, rgba(0, 0, 0, 0.62) 0%, rgba(0, 0, 0, 0.55) 45%, rgba(0, 0, 0, 0) 78%);
 }
 .player-audio-wrap {
   display: flex;

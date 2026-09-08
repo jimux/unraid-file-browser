@@ -166,7 +166,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     );
   }
 
-  throw new ApiError(codeForStatus(res.status, path), `unexpected response shape (HTTP ${res.status})`, res.status);
+  // Say what actually arrived. "unexpected response shape (HTTP 200)" alone is
+  // undiagnosable in the field: an empty body, a bridge that swallowed the
+  // envelope and a daemon that failed mid-encode all look identical.
+  const seen = text === "" ? "empty body" : `body starts: ${JSON.stringify(text.slice(0, 120))}`;
+  throw new ApiError(
+    codeForStatus(res.status, path),
+    `unexpected response shape (HTTP ${res.status}, ${seen})`,
+    res.status,
+  );
 }
 
 async function post<T>(path: string, body?: unknown, signal?: AbortSignal): Promise<T> {

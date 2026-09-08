@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1692,4 +1693,29 @@ func TestSSESubscriberCap(t *testing.T) {
 		t.Errorf("cap did not release after disconnects")
 	}
 	s.sseRelease()
+}
+
+// A value json cannot represent used to be written after WriteHeader(200),
+// leaving the client with an empty 200 body and nothing in the log — the
+// "unexpected response shape (HTTP 200)" a user reported from the field.
+func TestWriteOKUnencodableBecomesLoggedError(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writeOK(rec, map[string]any{"fps": math.NaN()})
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
+	}
+	var env struct {
+		OK    bool `json:"ok"`
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("body is not an envelope: %v (%q)", err, rec.Body.String())
+	}
+	if env.OK || env.Error.Code != types.ErrInternal {
+		t.Fatalf("envelope = %+v, want ok:false INTERNAL", env)
+	}
 }
